@@ -1,0 +1,292 @@
+import com.android.build.api.variant.AndroidComponentsExtension
+import org.gradle.api.Plugin
+import org.gradle.api.Project
+import org.gradle.api.Task
+import org.gradle.api.tasks.compile.AbstractCompile
+import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
+import java.io.File
+
+class CryptorPlugin : Plugin<Project> {
+
+    // -------------------------------------------------------------------------
+    // Deterministic obfuscated name derivation
+    //
+    // Names are derived from the encryption key so every project using a unique
+    // key gets a unique decryptor class/method name.  The derivation is stable
+    // across builds (same key → same names), which keeps Gradle's build cache
+    // valid. An attacker cannot guess the class/method name without knowing the key.
+    // -------------------------------------------------------------------------
+
+    companion object {
+        private val NAME_CHARS = "abcdefghijklmnopqrstuvwxyz"
+
+        /** Derive a 6-letter class name from the lower 48 bits of the key. */
+        fun deriveClassName(key: Long): String = buildString(6) {
+            var k = key
+            repeat(6) {
+                append(NAME_CHARS[((k and 0xFFL).toInt() % 26 + 26) % 26])
+                k = k ushr 8
+            }
+        }
+
+        /** Derive a 2-letter method name from the upper 16 bits of the key. */
+        fun deriveMethodName(key: Long): String = buildString(2) {
+            var k = key ushr 48
+            repeat(2) {
+                append(NAME_CHARS[((k and 0xFFL).toInt() % 26 + 26) % 26])
+                k = k ushr 8
+            }
+        }
+    }
+
+    override fun apply(project: Project) {
+        val extension = project.extensions.create(
+            "cryptor",
+            CryptorExtension::class.java
+        )
+
+        // Android modules: wire via AGP variant callback (must happen before afterEvaluate)
+        project.plugins.withId("com.android.application") { applyAndroid(project, extension) }
+        project.plugins.withId("com.android.library")     { applyAndroid(project, extension) }
+
+        // JVM / Desktop modules: wire after evaluation (when no Android plugin present)
+        project.afterEvaluate {
+            if (!extension.enabled.get()) {
+                project.logger.lifecycle("[Cryptor] enabled = false — all encryption skipped.")
+                return@afterEvaluate
+            }
+            val hasAndroid = project.plugins.hasPlugin("com.android.application") ||
+                             project.plugins.hasPlugin("com.android.library")
+            if (!hasAndroid) wireJvm(project, extension)
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Android wiring
+    // -------------------------------------------------------------------------
+    private fun applyAndroid(project: Project, extension: CryptorExtension) {
+        val androidComponents = project.extensions
+            .findByType(AndroidComponentsExtension::class.java) ?: return
+
+        // Accumulate the variant names that need asset encryption.
+        // Populated during onVariants, consumed in the afterEvaluate below.
+        val assetVariants = mutableListOf<String>()
+
+        androidComponents.onVariants { variant ->
+            if (!extension.enabled.get()) return@onVariants
+            if (extension.skipDebug.get() && variant.buildType == "debug") return@onVariants
+
+            val variantName = variant.name.replaceFirstChar { it.uppercaseChar() }
+            val encryptTask = project.tasks.register(
+                "encryptStrings$variantName",
+                EncryptClassesTask::class.java
+            ) { task ->
+                task.encryptionKey.set(extension.key)
+                task.excludePackages.set(extension.excludePackages)
+                task.decryptorClassName.set(extension.key.map  { k -> deriveClassName(k)  })
+                task.decryptorMethodName.set(extension.key.map { k -> deriveMethodName(k) })
+                task.encryptStrings.set(extension.encryptStrings)
+                // Never inject wrappers into the Android module — CryptorFilesWrapper and
+                // CryptorAudioWrapper are already injected into core's compiled classes by
+                // the JVM wiring path. DEX-merging core again would cause duplicate class errors.
+                task.injectFilesWrapper.set(false)
+                task.outputDir.set(
+                    project.layout.buildDirectory.dir("encryptedClasses/$variantName")
+                )
+            }
+
+            // Hook lazily into the Kotlin / Java compile task for this variant.
+            // Note: we do NOT call encryptTask.configure() here because Gradle does not allow
+            // configuring one task while another is being realized (NamedDomainObjectProvider
+            // context restriction). inputDir is @Optional so the task runs safely without it.
+            project.tasks.matching {
+                it.name == "compile${variantName}Kotlin" ||
+                it.name == "compile${variantName}JavaWithJavac"
+            }.configureEach { compileTask ->
+                compileTask.finalizedBy(encryptTask)
+            }
+
+            if (extension.encryptAssets.get()) {
+                assetVariants += variantName
+            }
+        }
+
+        // Asset-encryption task wiring.
+        //
+        // WHY afterEvaluate here (not inside onVariants):
+        //   onVariants runs DURING AGP's afterEvaluate. AGP hasn't finished creating its tasks
+        //   yet when onVariants fires, so tasks.named("mergeReleaseAssets") throws.
+        //   Our plugin is applied AFTER com.android.application in every consumer build.gradle,
+        //   so our afterEvaluate callback is queued AFTER AGP's. By the time ours executes,
+        //   all AGP tasks exist and tasks.named() is safe.
+        project.afterEvaluate {
+            if (!extension.enabled.get() || !extension.encryptAssets.get()) return@afterEvaluate
+
+            for (variantName in assetVariants) {
+                val lcVariant = variantName.replaceFirstChar { it.lowercaseChar() }
+                val mergedAssetsPath = "intermediates/assets/$lcVariant/merge${variantName}Assets"
+
+                val encryptAssetsTask = project.tasks.register(
+                    "cryptorEncryptAssets$variantName"
+                ) { t ->
+                    t.group = "cryptor"
+                    t.description = "Encrypts merged Android assets in-place for $variantName"
+                    val mergedDir = project.layout.buildDirectory.dir(mergedAssetsPath)
+                    // No inputs.dir() — Gradle 9 strictly validates declared input directories exist
+                    // at configuration time, which fails for AGP-created dirs. Since we use
+                    // upToDateWhen { false } the task always runs; the doLast guards against
+                    // the directory not existing.
+                    t.outputs.upToDateWhen { false }
+                    t.doLast {
+                        val dir = mergedDir.get().asFile
+                        if (!dir.exists()) return@doLast
+                        val key  = extension.key.get()
+                        val exts = extension.assetExtensions.get().map { it.lowercase() }.toSet()
+                        val magic = byteArrayOf(0xC0.toByte(), 0xDE.toByte(), 0xBA.toByte(), 0xBE.toByte())
+                        dir.walkTopDown().filter { it.isFile }.forEach { src ->
+                            if (src.extension.lowercase() !in exts) return@forEach
+                            val raw = src.readBytes()
+                            if (raw.size >= 4 && raw[0] == magic[0] && raw[1] == magic[1] &&
+                                raw[2] == magic[2] && raw[3] == magic[3]) return@forEach
+                            src.writeBytes(magic + XorEncryptor.encrypt(raw, key))
+                        }
+                    }
+                }
+
+                // AGP tasks are guaranteed to exist here — safe to use tasks.named()
+                project.tasks.named("merge${variantName}Assets").configure {
+                    it.finalizedBy(encryptAssetsTask)
+                }
+                listOf(
+                    "package$variantName",
+                    "bundle${variantName}Aar",
+                    "bundle${variantName}",
+                    // compressReleaseAssets runs between mergeReleaseAssets and packageRelease.
+                    // It reads from the mergeReleaseAssets output directory, so it must depend on
+                    // our encrypt task (which also writes to that directory) to ensure assets are
+                    // encrypted before compressReleaseAssets copies them to its own output dir.
+                    "compress${variantName}Assets"
+                ).forEach { tName ->
+                    project.tasks.matching { it.name == tName }
+                        .configureEach { it.dependsOn(encryptAssetsTask) }
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // JVM / Desktop wiring
+    // -------------------------------------------------------------------------
+    private fun wireJvm(project: Project, extension: CryptorExtension) {
+        val kotlinTask = project.tasks.findByName("compileKotlin")
+        val javaTask   = project.tasks.findByName("compileJava") as? AbstractCompile
+
+        if (kotlinTask == null && javaTask == null) {
+            project.logger.warn("[Cryptor] No compileKotlin or compileJava task found — skipping.")
+            return
+        }
+
+        // Collect all compile-output directories.
+        // KGP 1.x: KotlinCompile extends AbstractCompile — direct cast works.
+        // KGP 2.x: KotlinJvmCompile does NOT extend AbstractCompile — use reflection.
+        val compileTasks  = mutableListOf<Task>()
+        val compileDirs   = mutableListOf<File>()
+
+        kotlinTask?.let { t ->
+            val dir = resolveDestinationDir(t)
+            if (dir != null) {
+                compileTasks.add(t)
+                compileDirs.add(dir)
+            } else {
+                project.logger.warn("[encryptStrings] Could not resolve destinationDirectory for compileKotlin — Kotlin classes will not be encrypted.")
+            }
+        }
+        javaTask?.let { t ->
+            val dir = t.destinationDirectory.orNull?.asFile
+            if (dir != null && dir !in compileDirs) {
+                compileTasks.add(t)
+                compileDirs.add(dir)
+            }
+        }
+
+        if (compileTasks.isEmpty()) {
+            project.logger.warn("[Cryptor] No usable compile outputs found — skipping.")
+            return
+        }
+
+        val encryptTask = project.tasks.register("cryptorEncryptStrings", EncryptClassesTask::class.java) { task ->
+            task.encryptionKey.set(extension.key)
+            task.excludePackages.set(extension.excludePackages)
+            task.decryptorClassName.set(extension.key.map  { k -> deriveClassName(k)  })
+            task.decryptorMethodName.set(extension.key.map { k -> deriveMethodName(k) })
+            task.encryptStrings.set(extension.encryptStrings)
+            task.injectFilesWrapper.set(extension.encryptAssets)
+            task.inputDirs.from(*compileDirs.toTypedArray())
+            task.outputDir.set(project.layout.buildDirectory.dir("encryptedClasses"))
+        }
+
+        compileTasks.forEach { it.finalizedBy(encryptTask) }
+
+        // Register the asset-encryption task.
+        // Raw assets intentionally remain in resources.srcDirs so that IDE runs and the
+        // Gradle `run` task can load them without CryptorFilesWrapper being active.
+        // The JAR task below wires in the encrypted versions and excludes the raw copies.
+        var encryptAssetsTask: org.gradle.api.tasks.TaskProvider<EncryptAssetsTask>? = null
+
+        if (extension.encryptAssets.get() && extension.assetsDir.isPresent) {
+            val sourceSets = project.extensions.findByName("sourceSets")
+                as? org.gradle.api.tasks.SourceSetContainer
+            if (sourceSets?.findByName("main") != null) {
+                encryptAssetsTask = project.tasks.register(
+                    "cryptorEncryptAssets", EncryptAssetsTask::class.java
+                ) { task ->
+                    task.inputDir.set(extension.assetsDir)
+                    task.outputDir.set(project.layout.buildDirectory.dir("encryptedAssets"))
+                    task.encryptionKey.set(extension.key)
+                    task.assetExtensions.set(extension.assetExtensions)
+                }
+            } else {
+                project.logger.warn("[Cryptor] Could not find main SourceSet — asset encryption skipped.")
+            }
+        }
+
+        project.plugins.withId("java") {
+            project.tasks.named("jar", org.gradle.api.tasks.bundling.Jar::class.java) { jar ->
+                jar.dependsOn(encryptTask)
+                jar.from(encryptTask.flatMap { it.outputDir })
+                jar.exclude { details ->
+                    compileDirs.any { dir -> details.file.startsWith(dir) }
+                }
+
+                encryptAssetsTask?.let { assetsTask ->
+                    // Include encrypted assets in the JAR in place of the raw copies
+                    val encExtensions = extension.assetExtensions.get().toSet()
+                    val resourcesMain = project.layout.buildDirectory.dir("resources/main").get().asFile
+                    jar.dependsOn(assetsTask)
+                    jar.from(assetsTask.flatMap { it.outputDir })
+                    // Exclude the raw asset files processResources copied to build/resources/main/
+                    // so only encrypted versions from build/encryptedAssets/ land in the JAR
+                    jar.exclude { fileDetails ->
+                        fileDetails.file.extension in encExtensions &&
+                            fileDetails.file.canonicalPath.startsWith(
+                                resourcesMain.canonicalPath + java.io.File.separator
+                            )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Resolves the compile-output directory from a task.
+     *
+     * KGP 1.x: [KotlinJvmCompile] extends [AbstractCompile] — first branch hits.
+     * KGP 2.x: [KotlinJvmCompile] no longer extends [AbstractCompile] but it still
+     *          implements [KotlinJvmCompile] which exposes [destinationDirectory] directly.
+     */
+    private fun resolveDestinationDir(task: Task): File? {
+        (task as? AbstractCompile)?.destinationDirectory?.orNull?.asFile?.let { return it }
+        (task as? KotlinJvmCompile)?.destinationDirectory?.orNull?.asFile?.let { return it }
+        return null
+    }
+}
