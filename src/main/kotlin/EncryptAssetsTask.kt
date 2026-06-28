@@ -25,8 +25,10 @@ abstract class EncryptAssetsTask : DefaultTask() {
     fun encrypt() {
         val input  = inputDir.get().asFile
         val output = outputDir.get().asFile
-        val key    = encryptionKey.get()
         val exts   = assetExtensions.get().map { it.lowercase() }.toSet()
+
+        // Derive the 16-byte AES master key from the user-supplied 64-bit key
+        val masterKey = AesFileEncryptor.deriveAesKey(encryptionKey.get())
 
         output.deleteRecursively()
         output.mkdirs()
@@ -37,17 +39,18 @@ abstract class EncryptAssetsTask : DefaultTask() {
             dest.parentFile.mkdirs()
 
             if (src.extension.lowercase() in exts) {
-                // Prepend magic header so CryptorFilesWrapper can identify encrypted files
-                val encrypted = XorEncryptor.encrypt(src.readBytes(), key)
-                dest.writeBytes(MAGIC_HEADER + encrypted)
+                val raw = src.readBytes()
+                // Skip already-encrypted files (idempotent)
+                if (AesFileEncryptor.hasMagic(raw)) {
+                    dest.writeBytes(raw)
+                } else {
+                    // Use forward-slash relative path — matches CryptorFilesWrapper.normPath()
+                    val relPath = relative.path.replace(File.separatorChar, '/')
+                    dest.writeBytes(AesFileEncryptor.encrypt(raw, masterKey, relPath))
+                }
             } else {
                 src.copyTo(dest, overwrite = true)
             }
         }
-    }
-
-    companion object {
-        /** 4-byte magic header prepended to every encrypted asset. */
-        val MAGIC_HEADER = byteArrayOf(0xC0.toByte(), 0xDE.toByte(), 0xBA.toByte(), 0xBE.toByte())
     }
 }
