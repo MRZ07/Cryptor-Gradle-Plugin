@@ -350,12 +350,18 @@ abstract class EncryptClassesTask : DefaultTask() {
     }
 
     /**
-     * Prepends `KEY = realKey; ENABLED = true` to CryptorFilesWrapper's static initializer.
-     * Works because Kotlin omits the 0L / false default initializations (they are field defaults).
+     * Derives the 16-byte AES key from [key], splits it into four Ints, then
+     * prepends KEY_0..KEY_3 = <values>; ENABLED = true to CryptorFilesWrapper's <clinit>.
+     *
+     * Four separate Int PUTSTATICs are harder to recognise as "the key" than a single
+     * LDC Long instruction — each looks like an unrelated integer constant.
      */
     private fun patchCryptorFilesWrapperKeys(bytes: ByteArray, key: Long): ByteArray {
         val reader = ClassReader(bytes)
         val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
+
+        val masterKey = AesFileEncryptor.deriveAesKey(key)
+        val parts = AesFileEncryptor.splitKey(masterKey)  // [k0, k1, k2, k3]
 
         reader.accept(object : ClassVisitor(ASM9, writer) {
             override fun visitMethod(
@@ -367,8 +373,11 @@ abstract class EncryptClassesTask : DefaultTask() {
                     return object : MethodVisitor(ASM9, mv) {
                         override fun visitCode() {
                             super.visitCode()
-                            mv.visitLdcInsn(key)
-                            mv.visitFieldInsn(PUTSTATIC, "CryptorFilesWrapper", "KEY", "J")
+                            // Patch four Int fields — split key, harder to spot statically
+                            for (i in 0..3) {
+                                mv.visitLdcInsn(parts[i])
+                                mv.visitFieldInsn(PUTSTATIC, "CryptorFilesWrapper", "KEY_$i", "I")
+                            }
                             mv.visitInsn(ICONST_1)
                             mv.visitFieldInsn(PUTSTATIC, "CryptorFilesWrapper", "ENABLED", "Z")
                         }
