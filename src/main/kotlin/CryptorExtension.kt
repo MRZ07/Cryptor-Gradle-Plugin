@@ -49,8 +49,8 @@ abstract class CryptorExtension {
         encryptAssets.convention(true)
         assetExtensions.convention(listOf(
             "tmx", "png", "jpg", "jpeg",
-            "atlas", "pack", "json", "fnt", "ttf", "properties",
-            "mp3", "ogg", "wav"
+            "atlas", "pack", "fnt", "ttf",
+            "mp3", "ogg", "wav", "map"
         ))
     }
 }
