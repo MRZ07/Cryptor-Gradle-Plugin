@@ -140,15 +140,14 @@ class CryptorPlugin : Plugin<Project> {
                     t.doLast {
                         val dir = mergedDir.get().asFile
                         if (!dir.exists()) return@doLast
-                        val key  = extension.key.get()
+                        val masterKey = AesFileEncryptor.deriveAesKey(extension.key.get())
                         val exts = extension.assetExtensions.get().map { it.lowercase() }.toSet()
-                        val magic = byteArrayOf(0xC0.toByte(), 0xDE.toByte(), 0xBA.toByte(), 0xBE.toByte())
                         dir.walkTopDown().filter { it.isFile }.forEach { src ->
                             if (src.extension.lowercase() !in exts) return@forEach
                             val raw = src.readBytes()
-                            if (raw.size >= 4 && raw[0] == magic[0] && raw[1] == magic[1] &&
-                                raw[2] == magic[2] && raw[3] == magic[3]) return@forEach
-                            src.writeBytes(magic + XorEncryptor.encrypt(raw, key))
+                            if (AesFileEncryptor.hasMagic(raw)) return@forEach
+                            val relPath = src.relativeTo(dir).path.replace(java.io.File.separatorChar, '/')
+                            src.writeBytes(AesFileEncryptor.encrypt(raw, masterKey, relPath))
                         }
                     }
                 }
