@@ -5,7 +5,7 @@ plugins {
 }
 
 group   = "com.github.MRZ07"
-version = "v1.7.7"
+version = "v1.8.0"
 
 repositories {
     mavenCentral()
