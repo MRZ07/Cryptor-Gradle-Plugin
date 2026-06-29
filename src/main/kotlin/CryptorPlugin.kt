@@ -2,9 +2,11 @@ import com.android.build.api.variant.AndroidComponentsExtension
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.Task
+import org.gradle.api.artifacts.ProjectDependency
 import org.gradle.api.tasks.compile.AbstractCompile
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import java.io.File
+import java.security.MessageDigest
 
 class CryptorPlugin : Plugin<Project> {
 
@@ -104,6 +106,7 @@ class CryptorPlugin : Plugin<Project> {
                 task.decryptorClassName.set(extension.key.map  { k -> deriveClassName(k)  })
                 task.decryptorMethodName.set(extension.key.map { k -> deriveMethodName(k) })
                 task.encryptStrings.set(extension.encryptStrings)
+                task.runtimeDecryptorHash.set(runtimeDecryptorHash())
                 // Never inject wrappers into the Android module — CryptorFilesWrapper and
                 // CryptorAudioWrapper are already injected into core's compiled classes by
                 // the JVM wiring path. DEX-merging core again would cause duplicate class errors.
@@ -192,6 +195,17 @@ class CryptorPlugin : Plugin<Project> {
     }
 
     // -------------------------------------------------------------------------
+    // Stale-cache guard: hash of the bundled StringDecryptor.class
+    // -------------------------------------------------------------------------
+    private fun runtimeDecryptorHash(): String {
+        val bytes = CryptorPlugin::class.java.classLoader
+            .getResourceAsStream("StringDecryptor.class")
+            ?.readBytes() ?: ByteArray(0)
+        return MessageDigest.getInstance("MD5").digest(bytes)
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    // -------------------------------------------------------------------------
     // JVM / Desktop wiring
     // -------------------------------------------------------------------------
     private fun wireJvm(project: Project, extension: CryptorExtension) {
@@ -231,6 +245,29 @@ class CryptorPlugin : Plugin<Project> {
             return
         }
 
+        // ---- Also include direct JVM implementation-dependency subprojects (e.g. :core) ----
+        // This ensures patchGdxFilesActivation finds Game subclasses that live in :core, and
+        // that all game-logic strings get encrypted — not just the launcher module's.
+        project.configurations.findByName("implementation")
+            ?.dependencies
+            ?.filterIsInstance<ProjectDependency>()
+            ?.forEach { dep ->
+                val sub = dep.dependencyProject
+                // Skip Android modules — their classes are DEX-merged separately
+                if (sub.plugins.hasPlugin("com.android.application") ||
+                    sub.plugins.hasPlugin("com.android.library")) return@forEach
+                sub.tasks.findByName("compileKotlin")?.let { t ->
+                    resolveDestinationDir(t)?.let { dir ->
+                        if (dir !in compileDirs) { compileTasks += t; compileDirs += dir }
+                    }
+                }
+                (sub.tasks.findByName("compileJava") as? AbstractCompile)?.let { t ->
+                    t.destinationDirectory.orNull?.asFile?.let { dir ->
+                        if (dir !in compileDirs) { compileTasks += t; compileDirs += dir }
+                    }
+                }
+            }
+
         val encryptTask = project.tasks.register("cryptorEncryptStrings", EncryptClassesTask::class.java) { task ->
             task.encryptionKey.set(extension.key)
             task.excludePackages.set(extension.excludePackages)
@@ -238,6 +275,7 @@ class CryptorPlugin : Plugin<Project> {
             task.decryptorMethodName.set(extension.key.map { k -> deriveMethodName(k) })
             task.encryptStrings.set(extension.encryptStrings)
             task.injectFilesWrapper.set(extension.encryptAssets)
+            task.runtimeDecryptorHash.set(runtimeDecryptorHash())
             task.inputDirs.from(*compileDirs.toTypedArray())
             task.outputDir.set(project.layout.buildDirectory.dir("encryptedClasses"))
         }

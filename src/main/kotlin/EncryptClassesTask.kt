@@ -73,6 +73,16 @@ abstract class EncryptClassesTask : DefaultTask() {
     @get:Optional
     abstract val injectFilesWrapper: Property<Boolean>
 
+    /**
+     * Hash of the bundled StringDecryptor.class template (injected at runtime into the
+     * target project). When this class changes (e.g. encryption algorithm update), the
+     * hash changes, and Gradle invalidates the task's build-cache entry — preventing stale
+     * cached output from being used with a mismatched encryption algorithm.
+     */
+    @get:Input
+    @get:Optional
+    abstract val runtimeDecryptorHash: Property<String>
+
     // -----------------------------------------------------------------------
     // Always-excluded internal prefixes
     // -----------------------------------------------------------------------
