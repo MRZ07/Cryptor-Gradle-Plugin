@@ -2,7 +2,6 @@ import com.android.build.api.variant.AndroidComponentsExtension
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.Task
-import org.gradle.api.artifacts.ProjectDependency
 import org.gradle.api.tasks.compile.AbstractCompile
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import java.io.File
@@ -248,14 +247,19 @@ class CryptorPlugin : Plugin<Project> {
         // ---- Also include direct JVM implementation-dependency subprojects (e.g. :core) ----
         // This ensures patchGdxFilesActivation finds Game subclasses that live in :core, and
         // that all game-logic strings get encrypted — not just the launcher module's.
-        project.configurations.findByName("implementation")
-            ?.dependencies
-            ?.filterIsInstance<ProjectDependency>()
-            ?.forEach { dep ->
-                val sub = dep.dependencyProject
-                // Skip Android modules — their classes are DEX-merged separately
-                if (sub.plugins.hasPlugin("com.android.application") ||
-                    sub.plugins.hasPlugin("com.android.library")) return@forEach
+        // Use rootProject.subprojects instead of ProjectDependency.getDependencyProject()
+        // to stay compatible with Gradle 8+ (where getDependencyProject() is restricted).
+        // NOTE: Only include subprojects that do NOT apply the Cryptor plugin themselves.
+        // Subprojects with their own Cryptor task already handle string encryption + patching.
+        // Including them here would cause double-encryption.
+        project.rootProject.subprojects
+            .filter { sub ->
+                sub != project &&
+                !sub.plugins.hasPlugin("com.android.application") &&
+                !sub.plugins.hasPlugin("com.android.library") &&
+                !sub.plugins.hasPlugin("com.github.MRZ07.Cryptor-Gradle-Plugin")
+            }
+            .forEach { sub ->
                 sub.tasks.findByName("compileKotlin")?.let { t ->
                     resolveDestinationDir(t)?.let { dir ->
                         if (dir !in compileDirs) { compileTasks += t; compileDirs += dir }
