@@ -37,6 +37,24 @@ class CryptorPlugin : Plugin<Project> {
                 k = k ushr 8
             }
         }
+
+        /** Derive a 6-letter obfuscated class name for CryptorFilesWrapper from the key. */
+        fun deriveFilesWrapperName(key: Long): String = buildString(6) {
+            var k = key xor 0x5555555555555555L
+            repeat(6) {
+                append(NAME_CHARS[((k and 0xFFL).toInt() % 26 + 26) % 26])
+                k = k ushr 8
+            }
+        }
+
+        /** Derive a 6-letter obfuscated class name for CryptorAudioWrapper from the key. */
+        fun deriveAudioWrapperName(key: Long): String = buildString(6) {
+            var k = key xor -0x5555555555555556L  // == key XOR 0xAAAAAAAAAAAAAAAA
+            repeat(6) {
+                append(NAME_CHARS[((k and 0xFFL).toInt() % 26 + 26) % 26])
+                k = k ushr 8
+            }
+        }
     }
 
     override fun apply(project: Project) {
@@ -145,7 +163,7 @@ class CryptorPlugin : Plugin<Project> {
                         dir.walkTopDown().filter { it.isFile }.forEach { src ->
                             if (src.extension.lowercase() !in exts) return@forEach
                             val raw = src.readBytes()
-                            if (AesFileEncryptor.hasMagic(raw)) return@forEach
+                            if (AesFileEncryptor.hasMagic(raw, masterKey)) return@forEach
                             val relPath = src.relativeTo(dir).path.replace(java.io.File.separatorChar, '/')
                             src.writeBytes(AesFileEncryptor.encrypt(raw, masterKey, relPath))
                         }
