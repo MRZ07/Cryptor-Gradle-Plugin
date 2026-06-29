@@ -25,10 +25,14 @@ abstract class CryptorExtension {
      */
     abstract val skipDebug: Property<Boolean>
 
-    /** When true (default), string literals in class files are XOR-encrypted at build time. */
+    /** When true (default), string literals in class files are encrypted at build time. */
     abstract val encryptStrings: Property<Boolean>
 
-    /** When true (default), asset files in assetsDir are XOR-encrypted at build time. */
+    /**
+     * When true (default), asset files in assetsDir are AES-128-CTR encrypted at build time.
+     * json and properties files are intentionally excluded from the default extensions —
+     * plain-text configs should remain readable by tools and launchers.
+     */
     abstract val encryptAssets: Property<Boolean>
 
     /** Directory containing the game assets. Defaults to a folder named "assets" next to the project root. */
@@ -36,7 +40,8 @@ abstract class CryptorExtension {
 
     /**
      * File extensions to encrypt. All other files are copied as-is.
-     * Defaults cover common LibGDX asset types including audio.
+     * Defaults cover common LibGDX asset types including audio and level maps.
+     * json and properties are excluded by design — plain-text configs must not be encrypted.
      */
     abstract val assetExtensions: ListProperty<String>
 
