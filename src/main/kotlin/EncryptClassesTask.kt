@@ -138,7 +138,11 @@ abstract class EncryptClassesTask : DefaultTask() {
 
         if (injectFilesWrapper.orElse(false).get()) {
             injectCryptorFilesWrapper(output, key)
-            patchGdxFilesActivation(output, "CryptorFilesWrapper")
+            patchGdxFilesActivation(
+                output,
+                CryptorPlugin.deriveFilesWrapperName(key),
+                CryptorPlugin.deriveAudioWrapperName(key)
+            )
         }
     }
 
@@ -283,40 +287,57 @@ abstract class EncryptClassesTask : DefaultTask() {
         return writer.toByteArray()
     }
 
-    // -----------------------------------------------------------------------
-    // CryptorFilesWrapper injection
-    // -----------------------------------------------------------------------
     private fun injectCryptorFilesWrapper(outputDir: File, key: Long) {
-        val classLoader = EncryptClassesTask::class.java.classLoader
+        val classLoader  = EncryptClassesTask::class.java.classLoader
+        val filesName    = CryptorPlugin.deriveFilesWrapperName(key)
+        val audioName    = CryptorPlugin.deriveAudioWrapperName(key)
 
-        // Patch the main CryptorFilesWrapper class: prepend KEY = realKey; ENABLED = true to <clinit>
-        val mainName = "CryptorFilesWrapper"
-        val mainBytes = classLoader.getResourceAsStream("$mainName.class")
-            ?.readBytes()
-            ?: error("$mainName.class not found in plugin JAR resources")
-        File(outputDir, "$mainName.class").writeBytes(patchCryptorFilesWrapperKeys(mainBytes, key))
+        // ---- CryptorFilesWrapper: patch keys then rename ----
+        val mainBytes = classLoader.getResourceAsStream("CryptorFilesWrapper.class")
+            ?.readBytes() ?: error("CryptorFilesWrapper.class not found in plugin JAR")
 
-        // Copy companion and inner class as-is (no key patching needed)
-        listOf(
-            "CryptorFilesWrapper\$Companion",
-            "CryptorFilesWrapper\$CryptorFileHandle"
-        ).forEach { name ->
-            val bytes = classLoader.getResourceAsStream("$name.class")?.readBytes()
-            if (bytes != null) File(outputDir, "$name.class").writeBytes(bytes)
-        }
+        val patched = patchCryptorFilesWrapperKeys(mainBytes, key)
+        File(outputDir, "$filesName.class").writeBytes(
+            renameClass(patched, "CryptorFilesWrapper", filesName))
 
-        // Inject CryptorAudioWrapper (and its companion) — patches Gdx.audio in patchGdxFilesActivation.
-        // ENABLED is patched to true so the wrapper is active in encrypted builds.
-        val audioName = "CryptorAudioWrapper"
-        val audioBytes = classLoader.getResourceAsStream("$audioName.class")?.readBytes()
+        listOf("CryptorFilesWrapper\$Companion", "CryptorFilesWrapper\$CryptorFileHandle")
+            .forEach { innerName ->
+                val inner = classLoader.getResourceAsStream("$innerName.class")?.readBytes()
+                if (inner != null) {
+                    val newName = innerName.replace("CryptorFilesWrapper", filesName)
+                    File(outputDir, "$newName.class").writeBytes(
+                        renameClass(inner, "CryptorFilesWrapper", filesName))
+                }
+            }
+
+        // ---- CryptorAudioWrapper: patch enabled then rename ----
+        val audioBytes = classLoader.getResourceAsStream("CryptorAudioWrapper.class")?.readBytes()
         if (audioBytes != null) {
-            File(outputDir, "$audioName.class").writeBytes(patchCryptorAudioWrapperEnabled(audioBytes))
+            File(outputDir, "$audioName.class").writeBytes(
+                renameClass(patchCryptorAudioWrapperEnabled(audioBytes), "CryptorAudioWrapper", audioName))
         }
-        val audioCompanion = "CryptorAudioWrapper\$Companion"
-        val audioCompanionBytes = classLoader.getResourceAsStream("$audioCompanion.class")?.readBytes()
-        if (audioCompanionBytes != null) {
-            File(outputDir, "$audioCompanion.class").writeBytes(audioCompanionBytes)
+        val audioCompanion = classLoader.getResourceAsStream("CryptorAudioWrapper\$Companion.class")?.readBytes()
+        if (audioCompanion != null) {
+            File(outputDir, "${audioName}\$Companion.class").writeBytes(
+                renameClass(audioCompanion, "CryptorAudioWrapper", audioName))
         }
+    }
+
+    /**
+     * Renames all occurrences of [oldName] to [newName] inside [bytes] using ClassRemapper.
+     * Updates the class declaration, field descriptors, method descriptors, and all INVOKESTATIC /
+     * GETSTATIC / PUTSTATIC / NEW references consistently.
+     */
+    private fun renameClass(bytes: ByteArray, oldName: String, newName: String): ByteArray {
+        val reader = ClassReader(bytes)
+        val writer = ClassWriter(0)
+        val remapper = object : Remapper() {
+            override fun map(internalName: String): String =
+                if (internalName.startsWith(oldName)) internalName.replace(oldName, newName)
+                else internalName
+        }
+        reader.accept(ClassRemapper(writer, remapper), 0)
+        return writer.toByteArray()
     }
 
     /**
@@ -349,19 +370,13 @@ abstract class EncryptClassesTask : DefaultTask() {
         return writer.toByteArray()
     }
 
-    /**
-     * Derives the 16-byte AES key from [key], splits it into four Ints, then
-     * prepends KEY_0..KEY_3 = <values>; ENABLED = true to CryptorFilesWrapper's <clinit>.
-     *
-     * Four separate Int PUTSTATICs are harder to recognise as "the key" than a single
-     * LDC Long instruction — each looks like an unrelated integer constant.
-     */
     private fun patchCryptorFilesWrapperKeys(bytes: ByteArray, key: Long): ByteArray {
-        val reader = ClassReader(bytes)
-        val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
-
+        val reader    = ClassReader(bytes)
+        val writer    = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
         val masterKey = AesFileEncryptor.deriveAesKey(key)
-        val parts = AesFileEncryptor.splitKey(masterKey)  // [k0, k1, k2, k3]
+        val parts     = AesFileEncryptor.splitKey(masterKey)
+        // Veil constants: injected as fake unrelated integers; XOR'd at runtime to produce key parts
+        val veils = intArrayOf(0x5A4F2B1C, 0xD7E3A09F.toInt(), 0x3C8B5E71, 0xF1260D84.toInt())
 
         reader.accept(object : ClassVisitor(ASM9, writer) {
             override fun visitMethod(
@@ -373,9 +388,12 @@ abstract class EncryptClassesTask : DefaultTask() {
                     return object : MethodVisitor(ASM9, mv) {
                         override fun visitCode() {
                             super.visitCode()
-                            // Patch four Int fields — split key, harder to spot statically
+                            // Emit: KEY_i = VEIL_i XOR (VEIL_i XOR parts[i])
+                            // Neither constant alone is a key part; XOR reveals it at runtime.
                             for (i in 0..3) {
-                                mv.visitLdcInsn(parts[i])
+                                mv.visitLdcInsn(veils[i])
+                                mv.visitLdcInsn(veils[i] xor parts[i])
+                                mv.visitInsn(IXOR)
                                 mv.visitFieldInsn(PUTSTATIC, "CryptorFilesWrapper", "KEY_$i", "I")
                             }
                             mv.visitInsn(ICONST_1)
@@ -386,7 +404,6 @@ abstract class EncryptClassesTask : DefaultTask() {
                 return mv
             }
         }, 0)
-
         return writer.toByteArray()
     }
 
@@ -400,7 +417,7 @@ abstract class EncryptClassesTask : DefaultTask() {
     // No string literals, no reflection — ProGuard renames both the class reference
     // in the bytecode AND the CryptorFilesWrapper class itself consistently.
     // -----------------------------------------------------------------------
-    private fun patchGdxFilesActivation(outputDir: File, wrapperClassName: String) {
+    private fun patchGdxFilesActivation(outputDir: File, filesWrapperName: String, audioWrapperName: String) {
         // Pass 1: find the concrete class that extends com/badlogic/gdx/Game
         val targetFile = outputDir.walkTopDown()
             .filter { it.isFile && it.extension == "class" }
@@ -426,7 +443,7 @@ abstract class EncryptClassesTask : DefaultTask() {
                     return object : MethodVisitor(ASM9, mv) {
                         override fun visitCode() {
                             super.visitCode()
-                            emitWrapperInstall(mv, wrapperClassName)
+                            emitWrapperInstall(mv, filesWrapperName, audioWrapperName)
                         }
                     }
                 }
@@ -442,7 +459,7 @@ abstract class EncryptClassesTask : DefaultTask() {
                 if (!resumeFound[0]) {
                     val mv = writer.visitMethod(ACC_PUBLIC, "resume", "()V", null, null)
                     mv.visitCode()
-                    emitWrapperInstall(mv, wrapperClassName)
+                    emitWrapperInstall(mv, filesWrapperName, audioWrapperName)
                     // super.resume() — preserves the existing Game screen lifecycle
                     mv.visitVarInsn(ALOAD, 0)
                     mv.visitMethodInsn(INVOKESPECIAL, "com/badlogic/gdx/Game", "resume", "()V", false)
@@ -459,26 +476,26 @@ abstract class EncryptClassesTask : DefaultTask() {
 
     /**
      * Emits the two-wrapper install sequence into [mv]:
-     *   Gdx.files = new [wrapperClassName](Gdx.files)
-     *   Gdx.audio = new CryptorAudioWrapper(Gdx.audio)
+     *   Gdx.files = new [filesWrapperName](Gdx.files)
+     *   Gdx.audio = new [audioWrapperName](Gdx.audio)
      *
      * Called at the top of both create()V and resume()V so that the wrappers survive
      * Android's onResume() reset of Gdx.audio / Gdx.files.
      */
-    private fun emitWrapperInstall(mv: MethodVisitor, wrapperClassName: String) {
+    private fun emitWrapperInstall(mv: MethodVisitor, filesWrapperName: String, audioWrapperName: String) {
         // Gdx.files = new CryptorFilesWrapper(Gdx.files)
-        mv.visitTypeInsn(NEW, wrapperClassName)
+        mv.visitTypeInsn(NEW, filesWrapperName)
         mv.visitInsn(DUP)
         mv.visitFieldInsn(GETSTATIC, "com/badlogic/gdx/Gdx", "files", "Lcom/badlogic/gdx/Files;")
-        mv.visitMethodInsn(INVOKESPECIAL, wrapperClassName, "<init>", "(Lcom/badlogic/gdx/Files;)V", false)
+        mv.visitMethodInsn(INVOKESPECIAL, filesWrapperName, "<init>", "(Lcom/badlogic/gdx/Files;)V", false)
         mv.visitFieldInsn(PUTSTATIC, "com/badlogic/gdx/Gdx", "files", "Lcom/badlogic/gdx/Files;")
         // Gdx.audio = new CryptorAudioWrapper(Gdx.audio)
         // Intercepts newSound/newMusic to avoid ClassCastException on Android
         // (DefaultAndroidAudio casts FileHandle → AndroidFileHandle).
-        mv.visitTypeInsn(NEW, "CryptorAudioWrapper")
+        mv.visitTypeInsn(NEW, audioWrapperName)
         mv.visitInsn(DUP)
         mv.visitFieldInsn(GETSTATIC, "com/badlogic/gdx/Gdx", "audio", "Lcom/badlogic/gdx/Audio;")
-        mv.visitMethodInsn(INVOKESPECIAL, "CryptorAudioWrapper", "<init>", "(Lcom/badlogic/gdx/Audio;)V", false)
+        mv.visitMethodInsn(INVOKESPECIAL, audioWrapperName, "<init>", "(Lcom/badlogic/gdx/Audio;)V", false)
         mv.visitFieldInsn(PUTSTATIC, "com/badlogic/gdx/Gdx", "audio", "Lcom/badlogic/gdx/Audio;")
     }
 
