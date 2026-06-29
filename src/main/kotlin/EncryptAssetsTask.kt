@@ -23,11 +23,9 @@ abstract class EncryptAssetsTask : DefaultTask() {
 
     @TaskAction
     fun encrypt() {
-        val input  = inputDir.get().asFile
-        val output = outputDir.get().asFile
-        val exts   = assetExtensions.get().map { it.lowercase() }.toSet()
-
-        // Derive the 16-byte AES master key from the user-supplied 64-bit key
+        val input     = inputDir.get().asFile
+        val output    = outputDir.get().asFile
+        val exts      = assetExtensions.get().map { it.lowercase() }.toSet()
         val masterKey = AesFileEncryptor.deriveAesKey(encryptionKey.get())
 
         output.deleteRecursively()
@@ -35,16 +33,14 @@ abstract class EncryptAssetsTask : DefaultTask() {
 
         input.walkTopDown().filter { it.isFile }.forEach { src ->
             val relative = src.relativeTo(input)
-            val dest = File(output, relative.path)
+            val dest     = File(output, relative.path)
             dest.parentFile.mkdirs()
 
             if (src.extension.lowercase() in exts) {
                 val raw = src.readBytes()
-                // Skip already-encrypted files (idempotent)
-                if (AesFileEncryptor.hasMagic(raw)) {
+                if (AesFileEncryptor.hasMagic(raw, masterKey)) {
                     dest.writeBytes(raw)
                 } else {
-                    // Use forward-slash relative path — matches CryptorFilesWrapper.normPath()
                     val relPath = relative.path.replace(File.separatorChar, '/')
                     dest.writeBytes(AesFileEncryptor.encrypt(raw, masterKey, relPath))
                 }
