@@ -331,6 +331,12 @@ abstract class EncryptClassesTask : DefaultTask() {
             File(outputDir, "${audioName}\$Companion.class").writeBytes(
                 renameClass(audioCompanion, "CryptorAudioWrapper", audioName))
         }
+
+        // ---- AesFileEncryptor: copy as-is (used by CryptorFileHandle at runtime) ----
+        // Not renamed because ProGuard updates all references consistently.
+        classLoader.getResourceAsStream("AesFileEncryptor.class")?.readBytes()?.let { bytes ->
+            File(outputDir, "AesFileEncryptor.class").writeBytes(bytes)
+        }
     }
 
     /**
