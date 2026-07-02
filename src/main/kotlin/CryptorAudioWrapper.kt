@@ -19,16 +19,18 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * This wrapper sidesteps the cast by:
  *  1. Reading the already-decrypted bytes from the handle via [FileHandle.readBytes].
- *  2. Writing them to a temp file on the device's internal files directory (not cache,
- *     which the OS may clean up under storage pressure).
- *  3. Passing [Gdx.files.absolute] of that temp file to the delegate — on Android,
+ *  2. Writing them to a file inside the app's internal files directory
+ *     (<pkg>/files/cryptor_audio/), which the OS never auto-cleans.
+ *  3. Passing [Gdx.files.absolute] of that file to the delegate — on Android,
  *     [com.badlogic.gdx.backends.android.AndroidFiles.absolute] returns an
  *     [com.badlogic.gdx.backends.android.AndroidFileHandle] with [FileType.Absolute],
  *     so the cast succeeds and the audio backend takes the file-path branch (no
  *     AssetManager involvement needed).
  *
- * Temp files are cached by source path so the same audio file is only decrypted and
- * written once per session. The written file is fsynced before handing its path to
+ * Files are cached by source path so the same audio file is only decrypted and
+ * written once per session. A path-derived filename (rather than a random one) means
+ * the same asset always maps to the same file on disk, preventing stale-file
+ * accumulation across app restarts. The file is fsynced before handing its path to
  * the audio backend, which prevents [MediaPlayer.setDataSourceFD] from reading a
  * partially-flushed file on devices with aggressive OS-level write caching.
  *
@@ -75,31 +77,45 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
         }
 
         val ext = fileHandle.extension().ifEmpty { "tmp" }
-        // Use createTempFile so the name is unique; the file lives in the process temp
-        // dir (app cache on Android). We keep a hard reference in [cache] so the OS
-        // cannot reclaim it while the app is running.
-        val temp = File.createTempFile("cryptor_", ".$ext")
-        temp.deleteOnExit()
+        // Write to the internal files directory, NOT the system temp / cache directory.
+        // On Android, java.io.tmpdir resolves to <pkg>/cache/ which the OS is allowed to
+        // clean up under storage pressure — even while the app is running. The sibling
+        // <pkg>/files/ directory is never auto-cleaned by the OS.
+        // We derive the files dir from the system temp dir: on Android, tmpdir is always
+        // <pkg>/cache, so resolveSibling("files") gives the safe <pkg>/files directory.
+        val tmpDir = File(System.getProperty("java.io.tmpdir", "."))
+        val baseDir = if (tmpDir.name == "cache" && tmpDir.parentFile != null)
+            tmpDir.resolveSibling("files")
+        else
+            tmpDir
+        val audioDir = File(baseDir, "cryptor_audio")
+        audioDir.mkdirs()
+
+        // Use a path-derived filename so the same asset always maps to the same file on
+        // disk. This prevents stale file accumulation across app restarts (no random
+        // suffix, no deleteOnExit needed) and keeps the on-disk state deterministic.
+        val safePath = path.replace('/', '_').replace('\\', '_')
+        val file = File(audioDir, "cryptor_${safePath}")
 
         // Write with an explicit fsync so the bytes are durably on disk before
         // MediaPlayer opens the file descriptor. Without this, some Android devices
         // report "setDataSourceFD failed: status=0x80000000" because the OS
         // write-back cache has not yet committed the data.
-        FileOutputStream(temp).use { fos ->
+        FileOutputStream(file).use { fos ->
             fos.write(bytes)
             fos.flush()
             fos.fd.sync()
         }
 
-        if (temp.length() != bytes.size.toLong()) {
-            temp.delete()
+        if (file.length() != bytes.size.toLong()) {
+            file.delete()
             throw GdxRuntimeException(
-                "Audio temp file size mismatch for $path " +
-                "(expected ${bytes.size}, got ${temp.length()})"
+                "Audio file size mismatch for $path " +
+                "(expected ${bytes.size}, got ${file.length()})"
             )
         }
 
-        cache[path] = temp
-        return Gdx.files.absolute(temp.absolutePath)
+        cache[path] = file
+        return Gdx.files.absolute(file.absolutePath)
     }
 }
