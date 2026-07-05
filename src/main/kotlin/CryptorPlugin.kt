@@ -128,6 +128,27 @@ class CryptorPlugin : Plugin<Project> {
 
             if (extension.encryptAssets.get()) {
                 assetVariants += variantName
+
+                // Inject consumer ProGuard rules so R8 does not dead-code-eliminate the
+                // key-derived CryptorFilesWrapper / CryptorAudioWrapper classes.
+                // The plugin JAR lives on the buildscript classpath — META-INF/proguard/
+                // is NOT auto-discovered there. We write the rules to a temp file and add
+                // it explicitly so R8 sees them during minification.
+                // allowobfuscation: R8 can still rename both classes. Obfuscation is preserved.
+                val rulesContent = """
+                    -keep,allowobfuscation class * implements com.badlogic.gdx.Files {
+                        <init>(com.badlogic.gdx.Files);
+                    }
+                    -keep,allowobfuscation class * implements com.badlogic.gdx.Audio {
+                        <init>(com.badlogic.gdx.Audio);
+                    }
+                """.trimIndent()
+                val rulesFile = project.layout.buildDirectory
+                    .file("cryptor/cryptor-consumer-rules.pro")
+                    .get().asFile
+                rulesFile.parentFile.mkdirs()
+                rulesFile.writeText(rulesContent)
+                variant.proguardFiles.add(project.objects.fileProperty().apply { set(rulesFile) })
             }
         }
 
