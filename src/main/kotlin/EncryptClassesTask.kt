@@ -67,7 +67,7 @@ abstract class EncryptClassesTask : DefaultTask() {
 
     /**
      * When true, CryptorFilesWrapper and its inner class are injected into the output
-     * with KEY and ENABLED patched to the real values.
+     * with KEY_0..KEY_3 patched to the real values.
      */
     @get:Input
     @get:Optional
@@ -201,13 +201,23 @@ abstract class EncryptClassesTask : DefaultTask() {
                 return
             }
 
-            // Encrypt the string and encode the result as an ISO-8859-1 string literal.
-            // ISO-8859-1 is a bijective byte↔char mapping — all 256 byte values round-trip
-            // correctly, so the encrypted bytes survive as a JVM string constant.
-            // This approach replaces O(N) inline bytecode with just two instructions,
-            // completely avoiding the JVM 64KB method-size limit.
-            val encrypted = XorEncryptor.encrypt(value, key)
-            val encryptedString = String(encrypted, Charsets.ISO_8859_1)
+            // AES-128-CTR string encryption.
+            // IV = first 8 bytes of murmur64(plaintext), repeated to 16 bytes.
+            // Stored as ISO-8859-1 chars: [8-byte IV prefix][ciphertext].
+            val plainBytes = value.toByteArray(Charsets.UTF_8)
+            val ivLong     = XorEncryptor.murmur64(plainBytes)
+            val ivPrefix   = ByteArray(8) { i -> ((ivLong ushr (i * 8)) and 0xFF).toByte() }
+            val iv         = ivPrefix + ivPrefix              // pad to 16 bytes
+
+            val masterKey  = AesFileEncryptor.deriveAesKey(key)
+            val cipher     = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding")
+            cipher.init(
+                javax.crypto.Cipher.ENCRYPT_MODE,
+                javax.crypto.spec.SecretKeySpec(masterKey, "AES"),
+                javax.crypto.spec.IvParameterSpec(iv)
+            )
+            val cipherBytes    = cipher.doFinal(plainBytes)
+            val encryptedString = String(ivPrefix + cipherBytes, Charsets.ISO_8859_1)
 
             mv.visitLdcInsn(encryptedString)
             mv.visitMethodInsn(
@@ -264,16 +274,17 @@ abstract class EncryptClassesTask : DefaultTask() {
     }
 
     /**
-     * Injects `KEY = <realKey>` at the start of StringDecryptor's static initializer.
+     * Patches KEY_0..KEY_3 into StringDecryptor's static initialiser.
      *
-     * The Kotlin compiler omits `LCONST_0; PUTSTATIC KEY` when the placeholder is 0L
-     * (because 0 is already the field default), so searching for LCONST_0 never works.
-     * Instead we unconditionally prepend `LDC key; PUTSTATIC KEY` to <clinit>.
-     *
-     * NOTE: operates on the original "StringDecryptor" name; [renameDecryptor] is called
-     * afterwards and updates the PUTSTATIC owner via ClassRemapper.
+     * Derives the 16-byte AES master key from [key], splits it into four Ints,
+     * and injects each as an XOR of two unrelated-looking constants (arithmetic veil)
+     * so no Int literal in the bytecode directly reveals a key part.
      */
     private fun patchDecryptorKey(bytes: ByteArray, key: Long): ByteArray {
+        val masterKey = AesFileEncryptor.deriveAesKey(key)
+        val parts     = AesFileEncryptor.splitKey(masterKey)
+        val veils     = intArrayOf(0x7A3F1B2C, 0xC4E8D059.toInt(), 0x51A6F390.toInt(), 0x8B2D7E4F.toInt())
+
         val reader = ClassReader(bytes)
         val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
 
@@ -287,9 +298,12 @@ abstract class EncryptClassesTask : DefaultTask() {
                     return object : MethodVisitor(ASM9, mv) {
                         override fun visitCode() {
                             super.visitCode()
-                            // Inject: KEY = <realKey> — ClassRemapper will update the owner
-                            mv.visitLdcInsn(key)
-                            mv.visitFieldInsn(PUTSTATIC, "StringDecryptor", "KEY", "J")
+                            for (i in 0..3) {
+                                mv.visitLdcInsn(veils[i])
+                                mv.visitLdcInsn(veils[i] xor parts[i])
+                                mv.visitInsn(IXOR)
+                                mv.visitFieldInsn(PUTSTATIC, "StringDecryptor", "KEY_$i", "I")
+                            }
                         }
                     }
                 }
@@ -323,11 +337,11 @@ abstract class EncryptClassesTask : DefaultTask() {
                 }
             }
 
-        // ---- CryptorAudioWrapper: patch enabled then rename ----
+        // ---- CryptorAudioWrapper: rename only (no ENABLED field) ----
         val audioBytes = classLoader.getResourceAsStream("CryptorAudioWrapper.class")?.readBytes()
         if (audioBytes != null) {
             File(outputDir, "$audioName.class").writeBytes(
-                renameClass(patchCryptorAudioWrapperEnabled(audioBytes), "CryptorAudioWrapper", audioName))
+                renameClass(audioBytes, "CryptorAudioWrapper", audioName))
         }
         val audioCompanion = classLoader.getResourceAsStream("CryptorAudioWrapper\$Companion.class")?.readBytes()
         if (audioCompanion != null) {
@@ -359,36 +373,6 @@ abstract class EncryptClassesTask : DefaultTask() {
         return writer.toByteArray()
     }
 
-    /**
-     * Prepends `ENABLED = true` to CryptorAudioWrapper's static initializer so that
-     * the wrapper is active at runtime in encrypted builds.
-     */
-    private fun patchCryptorAudioWrapperEnabled(bytes: ByteArray): ByteArray {
-        val reader = ClassReader(bytes)
-        val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
-
-        reader.accept(object : ClassVisitor(ASM9, writer) {
-            override fun visitMethod(
-                access: Int, name: String, descriptor: String,
-                signature: String?, exceptions: Array<out String>?
-            ): MethodVisitor {
-                val mv = super.visitMethod(access, name, descriptor, signature, exceptions)
-                if (name == "<clinit>") {
-                    return object : MethodVisitor(ASM9, mv) {
-                        override fun visitCode() {
-                            super.visitCode()
-                            mv.visitInsn(ICONST_1)
-                            mv.visitFieldInsn(PUTSTATIC, "CryptorAudioWrapper", "ENABLED", "Z")
-                        }
-                    }
-                }
-                return mv
-            }
-        }, 0)
-
-        return writer.toByteArray()
-    }
-
     private fun patchCryptorFilesWrapperKeys(bytes: ByteArray, key: Long): ByteArray {
         val reader    = ClassReader(bytes)
         val writer    = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
@@ -415,8 +399,6 @@ abstract class EncryptClassesTask : DefaultTask() {
                                 mv.visitInsn(IXOR)
                                 mv.visitFieldInsn(PUTSTATIC, "CryptorFilesWrapper", "KEY_$i", "I")
                             }
-                            mv.visitInsn(ICONST_1)
-                            mv.visitFieldInsn(PUTSTATIC, "CryptorFilesWrapper", "ENABLED", "Z")
                         }
                     }
                 }
