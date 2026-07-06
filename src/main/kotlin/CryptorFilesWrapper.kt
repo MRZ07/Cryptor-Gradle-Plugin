@@ -19,10 +19,10 @@ class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
     companion object {
         // Private — harder to read via reflection than @JvmField public.
         // Patched at build time via ASM PUTSTATIC in <clinit>.
-        @JvmField private var KEY_0: Int = 0
-        @JvmField private var KEY_1: Int = 0
-        @JvmField private var KEY_2: Int = 0
-        @JvmField private var KEY_3: Int = 0
+        @JvmField var KEY_0: Int = 0
+        @JvmField var KEY_1: Int = 0
+        @JvmField var KEY_2: Int = 0
+        @JvmField var KEY_3: Int = 0
 
         // Assembled once; KEY_0..KEY_3 are zeroed immediately after to shrink
         // the window during which all key material is present in the heap.

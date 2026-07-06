@@ -22,10 +22,10 @@ import javax.crypto.spec.SecretKeySpec
 object StringDecryptor {
     // Patched at build time by EncryptClassesTask via PUTSTATIC in <clinit>.
     // Private to prevent casual getDeclaredField() access without setAccessible().
-    @JvmField private var KEY_0: Int = 0
-    @JvmField private var KEY_1: Int = 0
-    @JvmField private var KEY_2: Int = 0
-    @JvmField private var KEY_3: Int = 0
+    @JvmField var KEY_0: Int = 0
+    @JvmField var KEY_1: Int = 0
+    @JvmField var KEY_2: Int = 0
+    @JvmField var KEY_3: Int = 0
 
     private val cipherKey: ByteArray by lazy {
         val buf = ByteBuffer.allocate(16)
