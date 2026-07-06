@@ -7,6 +7,7 @@ import com.badlogic.gdx.utils.GdxRuntimeException
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Wraps [Audio] so that [newSound] and [newMusic] work correctly when the
@@ -19,23 +20,21 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * This wrapper sidesteps the cast by:
  *  1. Reading the already-decrypted bytes from the handle via [FileHandle.readBytes].
- *  2. Writing them to a file inside the app's internal files directory
- *     (<pkg>/files/cryptor_audio/), which the OS never auto-cleans.
+ *  2. Writing them to a file inside the app's internal files directory under a
+ *     version-keyed subdirectory (<pkg>/files/cryptor_audio/<keyHash>/).
+ *     The key hash (first 4 bytes of SHA-256 of the master key, hex-encoded) makes
+ *     the directory unique per encryption key — on key rotation or version change
+ *     the old directory is cleaned up automatically on first launch.
  *  3. Passing [Gdx.files.absolute] of that file to the delegate — on Android,
  *     [com.badlogic.gdx.backends.android.AndroidFiles.absolute] returns an
  *     [com.badlogic.gdx.backends.android.AndroidFileHandle] with [FileType.Absolute],
- *     so the cast succeeds and the audio backend takes the file-path branch (no
- *     AssetManager involvement needed).
+ *     so the cast succeeds and the audio backend takes the file-path branch.
  *
  * Files are cached by source path so the same audio file is only decrypted and
- * written once per session. A path-derived filename (rather than a random one) means
- * the same asset always maps to the same file on disk, preventing stale-file
- * accumulation across app restarts. The file is fsynced before handing its path to
- * the audio backend, which prevents [MediaPlayer.setDataSourceFD] from reading a
- * partially-flushed file on devices with aggressive OS-level write caching.
+ * written once per session. The file is fsynced before handing its path to
+ * the audio backend to prevent partial-flush issues on some Android devices.
  *
- * [ENABLED] is patched at build time by the Cryptor Gradle Plugin (same mechanism
- * used for [CryptorFilesWrapper]) — identical to how StringDecryptor is patched.
+ * [ENABLED] is patched at build time by the Cryptor Gradle Plugin.
  */
 class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
 
@@ -44,6 +43,47 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
 
         /** Decrypted audio files keyed by their source path, reused across calls. */
         private val cache = ConcurrentHashMap<String, File>()
+
+        /** Guards the one-time stale-directory cleanup. */
+        private val cleanupDone = AtomicBoolean(false)
+
+        /**
+         * Hex-encoded first 4 bytes of SHA-256(masterKey).
+         * This matches [AesFileEncryptor.deriveMagic] so any change to the encryption
+         * key produces a different hash and triggers cleanup of the old audio directory.
+         */
+        private fun keyHash(): String {
+            val mk    = CryptorFilesWrapper.masterKey()
+            val magic = AesFileEncryptor.deriveMagic(mk)
+            return magic.joinToString("") { "%02x".format(it) }
+        }
+
+        /**
+         * Returns the versioned audio cache directory, cleaning up sibling directories
+         * from previous encryption keys on first call.
+         */
+        private fun resolveAudioDir(): File {
+            val tmpDir  = File(System.getProperty("java.io.tmpdir", "."))
+            val baseDir = if (tmpDir.name == "cache" && tmpDir.parentFile != null)
+                tmpDir.resolveSibling("files")
+            else
+                tmpDir
+
+            val parentDir  = File(baseDir, "cryptor_audio")
+            val currentDir = File(parentDir, keyHash())
+
+            // Delete sibling directories that belong to a previous key — runs at most once.
+            if (cleanupDone.compareAndSet(false, true) && parentDir.exists()) {
+                parentDir.listFiles()?.forEach { sibling ->
+                    if (sibling.isDirectory && sibling.name != currentDir.name) {
+                        sibling.deleteRecursively()
+                    }
+                }
+            }
+
+            currentDir.mkdirs()
+            return currentDir
+        }
     }
 
     override fun newSound(fileHandle: FileHandle): Sound =
@@ -76,31 +116,12 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
             )
         }
 
-        val ext = fileHandle.extension().ifEmpty { "tmp" }
-        // Write to the internal files directory, NOT the system temp / cache directory.
-        // On Android, java.io.tmpdir resolves to <pkg>/cache/ which the OS is allowed to
-        // clean up under storage pressure — even while the app is running. The sibling
-        // <pkg>/files/ directory is never auto-cleaned by the OS.
-        // We derive the files dir from the system temp dir: on Android, tmpdir is always
-        // <pkg>/cache, so resolveSibling("files") gives the safe <pkg>/files directory.
-        val tmpDir = File(System.getProperty("java.io.tmpdir", "."))
-        val baseDir = if (tmpDir.name == "cache" && tmpDir.parentFile != null)
-            tmpDir.resolveSibling("files")
-        else
-            tmpDir
-        val audioDir = File(baseDir, "cryptor_audio")
-        audioDir.mkdirs()
-
-        // Use a path-derived filename so the same asset always maps to the same file on
-        // disk. This prevents stale file accumulation across app restarts (no random
-        // suffix, no deleteOnExit needed) and keeps the on-disk state deterministic.
+        val audioDir = resolveAudioDir()
         val safePath = path.replace('/', '_').replace('\\', '_')
-        val file = File(audioDir, "cryptor_${safePath}")
+        val file     = File(audioDir, "cryptor_${safePath}")
 
         // Write with an explicit fsync so the bytes are durably on disk before
-        // MediaPlayer opens the file descriptor. Without this, some Android devices
-        // report "setDataSourceFD failed: status=0x80000000" because the OS
-        // write-back cache has not yet committed the data.
+        // MediaPlayer opens the file descriptor.
         FileOutputStream(file).use { fos ->
             fos.write(bytes)
             fos.flush()

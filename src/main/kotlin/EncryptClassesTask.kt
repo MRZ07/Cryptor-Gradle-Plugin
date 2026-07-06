@@ -114,32 +114,35 @@ abstract class EncryptClassesTask : DefaultTask() {
         inputDirs.files.filter { it.isDirectory }.forEach { sources.add(it) }
         inputDir.orNull?.asFile?.takeIf { it.isDirectory && it !in sources }?.let { sources.add(it) }
 
-        sources.forEach sourceLoop@{ inputRoot ->
-            inputRoot.walkTopDown().filter { it.isFile }.forEach fileLoop@{ classFile ->
-                val relative = classFile.relativeTo(inputRoot)
-                // Resolve destination; skip if already written by a previous source dir
-                val dest = File(output, relative.path)
-                if (dest.exists()) return@fileLoop
-                dest.parentFile?.mkdirs()
+        // Hoist constant: evaluated once per task run, not once per file in the parallel loop.
+        val doEncrypt = encryptStrings.orElse(true).get()
 
-                if (classFile.extension != "class") {
-                    classFile.copyTo(dest)
-                    return@fileLoop
+        sources.forEach { inputRoot ->
+            inputRoot.walkTopDown().filter { it.isFile }.toList()
+                .parallelStream()
+                .forEach { classFile ->
+                    val relative = classFile.relativeTo(inputRoot)
+                    val dest = File(output, relative.path)
+                    if (dest.exists()) return@forEach
+                    dest.parentFile?.mkdirs()
+
+                    if (classFile.extension != "class") {
+                        classFile.copyTo(dest)
+                        return@forEach
+                    }
+
+                    val internalName = relative.path.removeSuffix(".class").replace(File.separatorChar, '/')
+                    if (isExcluded(internalName, allExclusions)) {
+                        classFile.copyTo(dest)
+                        return@forEach
+                    }
+
+                    val bytes = if (doEncrypt)
+                        transformClass(classFile.readBytes(), key, decryptClass, decryptMethod)
+                    else
+                        classFile.readBytes()
+                    dest.writeBytes(bytes)
                 }
-
-                val internalName = relative.path.removeSuffix(".class").replace(File.separatorChar, '/')
-                if (isExcluded(internalName, allExclusions)) {
-                    classFile.copyTo(dest)
-                    return@fileLoop
-                }
-
-                val doEncrypt = encryptStrings.orElse(true).get()
-                val bytes = if (doEncrypt)
-                    transformClass(classFile.readBytes(), key, decryptClass, decryptMethod)
-                else
-                    classFile.readBytes()
-                dest.writeBytes(bytes)
-            }
         }
 
         if (encryptStrings.orElse(true).get()) {
