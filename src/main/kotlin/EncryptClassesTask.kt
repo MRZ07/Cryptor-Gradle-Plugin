@@ -436,61 +436,155 @@ abstract class EncryptClassesTask : DefaultTask() {
     // No string literals, no reflection — ProGuard renames both the class reference
     // in the bytecode AND the CryptorFilesWrapper class itself consistently.
     // -----------------------------------------------------------------------
+    /**
+     * Injects wrapper-install calls into the game's `create()` and `resume()` methods.
+     *
+     * Supports arbitrary class hierarchies — not just direct `Game` subclasses.
+     *
+     * Algorithm:
+     *  1. Build a complete class-info map from every .class file in [outputDir].
+     *  2. Identify all classes that extend `com/badlogic/gdx/Game` (directly or transitively).
+     *  3. Find "leaf" classes: game-hierarchy classes with no known subclass in [outputDir].
+     *  4. For each leaf, inject the wrapper-install preamble into `create()V` and `resume()V`.
+     *     If a method does not exist in the leaf class, synthesize it with a proper `super` call
+     *     so that the hierarchy's own implementation still runs after the wrappers are installed.
+     *
+     * This correctly handles patterns like `MyGame → GameBase → Game` where `MyGame.create()`
+     * overrides `GameBase.create()` without calling `super` — wrappers are installed at the
+     * most-derived entry point regardless of hierarchy depth.
+     */
     private fun patchGdxFilesActivation(outputDir: File, filesWrapperName: String, audioWrapperName: String) {
-        // Pass 1: find the concrete class that extends com/badlogic/gdx/Game
-        val targetFile = outputDir.walkTopDown()
-            .filter { it.isFile && it.extension == "class" }
-            .firstOrNull { ClassReader(it.readBytes()).superName == "com/badlogic/gdx/Game" }
-            ?: return  // not a LibGDX game project — skip silently
+        // ── Step 1: build class-info map ──────────────────────────────────────
+        data class ClassInfo(
+            val file:      File,
+            val bytes:     ByteArray,
+            val superName: String?,
+            val methods:   Set<String>          // "name()descriptor" — declared methods only
+        )
 
-        // Pass 2: patch create()V and resume()V; synthesize resume()V if absent.
-        val originalBytes = targetFile.readBytes()
-        val reader = ClassReader(originalBytes)
-        val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
+        val classMap = mutableMapOf<String, ClassInfo>()
+        outputDir.walkTopDown().filter { it.isFile && it.extension == "class" }.forEach { f ->
+            val bytes = f.readBytes()
+            val cr    = ClassReader(bytes)
+            val methods = mutableSetOf<String>()
+            cr.accept(object : ClassVisitor(ASM9) {
+                override fun visitMethod(
+                    access: Int, name: String, descriptor: String,
+                    signature: String?, exceptions: Array<out String>?
+                ): MethodVisitor? { methods += "$name$descriptor"; return null }
+            }, ClassReader.SKIP_CODE)
+            classMap[cr.className] = ClassInfo(f, bytes, cr.superName, methods)
+        }
 
-        // Mutable flag — captured in array so it's accessible inside the anonymous ClassVisitor.
-        val resumeFound = booleanArrayOf(false)
+        if (classMap.isEmpty()) return
 
-        reader.accept(object : ClassVisitor(ASM9, writer) {
-            override fun visitMethod(
-                access: Int, name: String, descriptor: String,
-                signature: String?, exceptions: Array<out String>?
-            ): MethodVisitor {
-                val mv = super.visitMethod(access, name, descriptor, signature, exceptions)
-                if ((name == "create" || name == "resume") && descriptor == "()V") {
-                    if (name == "resume") resumeFound[0] = true
-                    return object : MethodVisitor(ASM9, mv) {
-                        override fun visitCode() {
-                            super.visitCode()
-                            emitWrapperInstall(mv, filesWrapperName, audioWrapperName)
+        // ── Step 2: helpers ───────────────────────────────────────────────────
+        fun isGameSubclass(name: String?): Boolean {
+            if (name == null || name == "java/lang/Object") return false
+            if (name == "com/badlogic/gdx/Game") return true
+            return isGameSubclass(classMap[name]?.superName)
+        }
+
+        val gameClasses = classMap.filterValues { isGameSubclass(it.superName) }
+        if (gameClasses.isEmpty()) return
+
+        // A leaf has no other game-hierarchy class directly extending it.
+        val leafClasses = gameClasses.keys.filter { cls ->
+            gameClasses.keys.none { other -> other != cls && classMap[other]?.superName == cls }
+        }
+
+        // ── Step 3: patch create() in every leaf ──────────────────────────────
+        for (leafClass in leafClasses) {
+            val info   = classMap[leafClass]!!
+            val reader = ClassReader(info.bytes)
+            val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
+            val found  = booleanArrayOf(false)
+
+            reader.accept(object : ClassVisitor(ASM9, writer) {
+                override fun visitMethod(
+                    access: Int, name: String, descriptor: String,
+                    signature: String?, exceptions: Array<out String>?
+                ): MethodVisitor {
+                    val mv = super.visitMethod(access, name, descriptor, signature, exceptions)
+                    if (name == "create" && descriptor == "()V") {
+                        found[0] = true
+                        return object : MethodVisitor(ASM9, mv) {
+                            override fun visitCode() {
+                                super.visitCode()
+                                emitWrapperInstall(mv, filesWrapperName, audioWrapperName)
+                            }
                         }
                     }
+                    return mv
                 }
-                return mv
-            }
 
-            override fun visitEnd() {
-                // Synthesize resume()V when the subclass does not override it.
-                // AndroidApplication.onResume() resets Gdx.audio / Gdx.files to the bare
-                // Android implementations before ApplicationListener.resume() is called.
-                // We reinstall the wrappers at the top of resume() to keep decryption active
-                // across pause / resume cycles (e.g. going to home screen and back).
-                if (!resumeFound[0]) {
-                    val mv = writer.visitMethod(ACC_PUBLIC, "resume", "()V", null, null)
-                    mv.visitCode()
-                    emitWrapperInstall(mv, filesWrapperName, audioWrapperName)
-                    // super.resume() — preserves the existing Game screen lifecycle
-                    mv.visitVarInsn(ALOAD, 0)
-                    mv.visitMethodInsn(INVOKESPECIAL, "com/badlogic/gdx/Game", "resume", "()V", false)
-                    mv.visitInsn(RETURN)
-                    mv.visitMaxs(0, 0)  // recomputed by COMPUTE_MAXS
-                    mv.visitEnd()
+                override fun visitEnd() {
+                    if (!found[0]) {
+                        // create() not declared in leaf — synthesise one that installs
+                        // wrappers and then delegates to the superclass implementation.
+                        val superName = info.superName ?: "com/badlogic/gdx/Game"
+                        val mv = writer.visitMethod(ACC_PUBLIC, "create", "()V", null, null)
+                        mv.visitCode()
+                        emitWrapperInstall(mv, filesWrapperName, audioWrapperName)
+                        mv.visitVarInsn(ALOAD, 0)
+                        mv.visitMethodInsn(INVOKESPECIAL, superName, "create", "()V", false)
+                        mv.visitInsn(RETURN)
+                        mv.visitMaxs(0, 0)
+                        mv.visitEnd()
+                    }
+                    super.visitEnd()
                 }
-                super.visitEnd()
-            }
-        }, 0)
+            }, 0)
 
-        targetFile.writeBytes(writer.toByteArray())
+            info.file.writeBytes(writer.toByteArray())
+        }
+
+        // ── Step 4: patch resume() in every leaf ─────────────────────────────
+        // Re-read files from disk: Step 3 may have modified them.
+        for (leafClass in leafClasses) {
+            val info   = classMap[leafClass]!!
+            val reader = ClassReader(info.file.readBytes())
+            val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
+            val found  = booleanArrayOf(false)
+
+            reader.accept(object : ClassVisitor(ASM9, writer) {
+                override fun visitMethod(
+                    access: Int, name: String, descriptor: String,
+                    signature: String?, exceptions: Array<out String>?
+                ): MethodVisitor {
+                    val mv = super.visitMethod(access, name, descriptor, signature, exceptions)
+                    if (name == "resume" && descriptor == "()V") {
+                        found[0] = true
+                        return object : MethodVisitor(ASM9, mv) {
+                            override fun visitCode() {
+                                super.visitCode()
+                                emitWrapperInstall(mv, filesWrapperName, audioWrapperName)
+                            }
+                        }
+                    }
+                    return mv
+                }
+
+                override fun visitEnd() {
+                    if (!found[0]) {
+                        // Synthesise resume() — reinstalls wrappers after Android's onResume()
+                        // resets Gdx.audio / Gdx.files, then calls the inherited implementation.
+                        val superName = info.superName ?: "com/badlogic/gdx/Game"
+                        val mv = writer.visitMethod(ACC_PUBLIC, "resume", "()V", null, null)
+                        mv.visitCode()
+                        emitWrapperInstall(mv, filesWrapperName, audioWrapperName)
+                        mv.visitVarInsn(ALOAD, 0)
+                        mv.visitMethodInsn(INVOKESPECIAL, superName, "resume", "()V", false)
+                        mv.visitInsn(RETURN)
+                        mv.visitMaxs(0, 0)
+                        mv.visitEnd()
+                    }
+                    super.visitEnd()
+                }
+            }, 0)
+
+            info.file.writeBytes(writer.toByteArray())
+        }
     }
 
     /**
