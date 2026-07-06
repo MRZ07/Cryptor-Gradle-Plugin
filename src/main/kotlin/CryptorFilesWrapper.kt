@@ -8,30 +8,34 @@ import java.io.Reader
 /**
  * Wraps [Files] so every internal [FileHandle] is transparently AES-decrypted.
  *
- * KEY_0..KEY_3 and ENABLED are patched by the Cryptor Gradle Plugin via ASM at build time.
- * The four Int fields reconstruct a 16-byte AES master key; they are injected as results
- * of an XOR between two unrelated-looking constants (arithmetic veil) — see EncryptClassesTask.
+ * KEY_0..KEY_3 are patched by the Cryptor Gradle Plugin via ASM at build time.
+ * They are private to prevent casual reflection access and zeroed out after the
+ * master key has been assembled to reduce the heap exposure window.
+ * ENABLED has been removed: the wrapper is always active when injected; non-encrypted
+ * files pass through unchanged because [AesFileEncryptor.hasMagic] returns false.
  */
 class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
 
     companion object {
-        @JvmField var KEY_0: Int = 0
-        @JvmField var KEY_1: Int = 0
-        @JvmField var KEY_2: Int = 0
-        @JvmField var KEY_3: Int = 0
-        @JvmField var ENABLED: Boolean = false
+        // Private — harder to read via reflection than @JvmField public.
+        // Patched at build time via ASM PUTSTATIC in <clinit>.
+        @JvmField private var KEY_0: Int = 0
+        @JvmField private var KEY_1: Int = 0
+        @JvmField private var KEY_2: Int = 0
+        @JvmField private var KEY_3: Int = 0
 
-        // Reconstructed once after the static initialiser sets KEY_0..KEY_3.
-        // Using lazy avoids the ByteBuffer + masterKeyFromInts cost on every decrypt call.
+        // Assembled once; KEY_0..KEY_3 are zeroed immediately after to shrink
+        // the window during which all key material is present in the heap.
         private val _masterKey: ByteArray by lazy {
-            AesFileEncryptor.masterKeyFromInts(KEY_0, KEY_1, KEY_2, KEY_3)
+            val key = AesFileEncryptor.masterKeyFromInts(KEY_0, KEY_1, KEY_2, KEY_3)
+            KEY_0 = 0; KEY_1 = 0; KEY_2 = 0; KEY_3 = 0
+            key
         }
 
         internal fun masterKey(): ByteArray = _masterKey
     }
 
-    override fun internal(path: String): FileHandle =
-        if (ENABLED) CryptorFileHandle(delegate.internal(path)) else delegate.internal(path)
+    override fun internal(path: String): FileHandle = CryptorFileHandle(delegate.internal(path))
 
     inner class CryptorFileHandle(private val source: FileHandle)
         : FileHandle(source.path(), source.type()) {
@@ -40,11 +44,7 @@ class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
 
         /**
          * Decrypted bytes, computed at most once per handle instance.
-         *
-         * This is the central performance fix: LibGDX's AssetLoader calls read(),
-         * readBytes(), and length() independently — without caching, each call would
-         * trigger a full disk read + AES-CTR decrypt. The lazy delegate ensures the
-         * decrypt happens exactly once regardless of how many times the handle is read.
+         * Non-encrypted files (hasMagic = false) are returned as-is.
          */
         private val decrypted: ByteArray by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
             val raw = source.readBytes()
@@ -53,14 +53,10 @@ class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
             else raw
         }
 
-        // Each call returns a fresh, independently positioned stream over the cached bytes.
-        override fun read(): InputStream   = ByteArrayInputStream(decrypted)
+        override fun read(): InputStream    = ByteArrayInputStream(decrypted)
         override fun readBytes(): ByteArray = decrypted
-
         override fun reader(): Reader = InputStreamReader(read(), Charsets.UTF_8)
         override fun reader(charset: String): Reader = InputStreamReader(read(), charset)
-
-        // No disk read needed — size is known from the cached decrypted array.
         override fun length(): Long = decrypted.size.toLong()
 
         override fun map(): java.nio.ByteBuffer {
@@ -70,15 +66,15 @@ class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
             return buf
         }
 
-        override fun path(): String                = source.path()
-        override fun name(): String                = source.name()
-        override fun extension(): String           = source.extension()
+        override fun path(): String                 = source.path()
+        override fun name(): String                 = source.name()
+        override fun extension(): String            = source.extension()
         override fun nameWithoutExtension(): String = source.nameWithoutExtension()
         override fun pathWithoutExtension(): String = source.pathWithoutExtension()
-        override fun type(): Files.FileType        = source.type()
-        override fun exists(): Boolean             = source.exists()
-        override fun lastModified(): Long          = source.lastModified()
-        override fun isDirectory(): Boolean        = source.isDirectory
+        override fun type(): Files.FileType         = source.type()
+        override fun exists(): Boolean              = source.exists()
+        override fun lastModified(): Long           = source.lastModified()
+        override fun isDirectory(): Boolean         = source.isDirectory
 
         override fun child(name: String): FileHandle   = CryptorFileHandle(source.child(name))
         override fun sibling(name: String): FileHandle = CryptorFileHandle(source.sibling(name))
