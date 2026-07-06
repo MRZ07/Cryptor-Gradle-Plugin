@@ -1,11 +1,11 @@
 plugins {
     `java-gradle-plugin`
     `maven-publish`
-    kotlin("jvm") version "1.9.23"
+    kotlin("jvm") version "2.4.0"
 }
 
 group   = "com.github.MRZ07"
-version = "v1.9.3"
+version = "v1.9.4"
 
 repositories {
     mavenCentral()
@@ -29,7 +29,7 @@ dependencies {
     implementation("org.ow2.asm:asm:9.7")
     implementation("org.ow2.asm:asm-commons:9.7")
     compileOnly("com.android.tools.build:gradle:8.3.0")
-    compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.23")
+    compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.0")
     compileOnly("com.badlogicgames.gdx:gdx:1.14.0")
 }
 
