@@ -211,16 +211,35 @@ abstract class EncryptClassesTask : DefaultTask() {
         private val decryptorMethod: String
     ) : MethodVisitor(ASM9, mv) {
 
+        /** Modified-UTF-8 byte count for an ISO-8859-1 [s] without encoding it. */
+        private fun modifiedUtf8Length(s: String): Int {
+            var len = 0
+            for (c in s) {
+                len += when {
+                    c.code in 0x0001..0x007F -> 1
+                    c.code == 0x0000 || c.code in 0x0080..0x07FF -> 2
+                    else -> 3
+                }
+            }
+            return len
+        }
+
         override fun visitLdcInsn(value: Any?) {
             if (value !is String) {
                 super.visitLdcInsn(value)
                 return
             }
 
-            // XOR string encryption — same-size output (plain + 8B salt). No
-            // 65535-byte CONSTANT_Utf8 limit risk, no javax.crypto dependency.
+            // XOR string encryption — output = 8B salt + plaintext-sized payload.
             val saltBytes = XorEncryptor.encrypt(value, key)
             val encryptedString = String(saltBytes, Charsets.ISO_8859_1)
+
+            // Guard: CONSTANT_Utf8 has a 65535-byte limit. Encrypted bytes >= 0x80
+            // become 2 bytes in modified UTF-8. Falls back to plaintext if exceeded.
+            if (modifiedUtf8Length(encryptedString) > 65535) {
+                mv.visitLdcInsn(value)
+                return
+            }
 
             mv.visitLdcInsn(encryptedString)
             mv.visitMethodInsn(
