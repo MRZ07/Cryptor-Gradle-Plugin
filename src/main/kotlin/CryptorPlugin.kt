@@ -360,18 +360,22 @@ class CryptorPlugin : Plugin<Project> {
         // plus its own compile dir).
         val firstCompileDir = compileDirs.firstOrNull()
         encryptTask.configure { task ->
-            val decryptName = task.decryptorClassName.orNull ?: ""
             compileDirs.forEach { compileDir ->
                 val isPrimary = compileDir == firstCompileDir
                 task.doLast {
                     val encryptedDir = task.outputDir.get().asFile
                     if (!encryptedDir.exists()) return@doLast
+                    val key = task.encryptionKey.get()
+                    val decryptName = task.decryptorClassName.orNull ?: ""
+                    val filesName = CryptorPlugin.deriveFilesWrapperName(key)
+                    val audioName = CryptorPlugin.deriveAudioWrapperName(key)
                     encryptedDir.walkTopDown().filter { it.isFile }.forEach { cls ->
                         val rel = cls.relativeTo(encryptedDir)
                         val name = cls.name
-                        // Injected classes: only copy to the project's own compile output.
                         val isInjected = name == "AesFileEncryptor.class" ||
                             name == "$decryptName.class" ||
+                            name.startsWith(filesName) ||
+                            name.startsWith(audioName) ||
                             name.startsWith("CryptorFilesWrapper") ||
                             name.startsWith("CryptorAudioWrapper")
                         if (isInjected && !isPrimary) return@forEach
