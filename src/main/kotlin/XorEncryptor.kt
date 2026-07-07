@@ -1,10 +1,31 @@
 /**
- * XorEncryptor — retained for any byte-level callers.
- * String encryption has moved to AES-128-CTR in [EncryptClassesTask].
- * [murmur64] is used to derive the IV prefix for AES string encryption.
+ * String encryption: per-string derived key via murmur64 salt.
+ *
+ * Salt = murmur64(plaintext UTF-8 bytes). Stored as the first 8 bytes of output.
+ * derivedKey = configKey XOR salt
+ *
+ * This ensures that recovering one string's key does not help decrypt any other string.
+ * StringDecryptor mirrors this logic at runtime.
  */
 object XorEncryptor {
 
+    /**
+     * Encrypts [value] for injection as a class-file LDC constant.
+     * Returns [salt (8 bytes)] + [XOR-encrypted UTF-8 plaintext].
+     */
+    fun encrypt(value: String, key: Long): ByteArray {
+        val plainBytes = value.toByteArray(Charsets.UTF_8)
+        val salt       = murmur64(plainBytes)
+        val derivedKey = key xor salt
+        val saltBytes  = ByteArray(8) { i -> ((salt ushr (i * 8)) and 0xFF).toByte() }
+        val encrypted  = ByteArray(plainBytes.size) { i ->
+            val kb = ((derivedKey ushr ((i % 8) * 8)) and 0xFF).toInt()
+            (plainBytes[i].toInt() xor kb).toByte()
+        }
+        return saltBytes + encrypted
+    }
+
+    /** Raw byte-level XOR (retained for any direct byte-level callers). */
     fun encrypt(bytes: ByteArray, key: Long): ByteArray =
         ByteArray(bytes.size) { i ->
             val kb = ((key ushr ((i % 8) * 8)) and 0xFF).toInt()
@@ -13,7 +34,6 @@ object XorEncryptor {
 
     // -------------------------------------------------------------------------
     // 64-bit hash — deterministic, no external deps
-    // Used to derive the AES IV prefix for string encryption.
     // -------------------------------------------------------------------------
     internal fun murmur64(data: ByteArray): Long {
         var h = -0x6C62272E07BB0142L

@@ -66,6 +66,16 @@ abstract class EncryptClassesTask : DefaultTask() {
     abstract val encryptStrings: Property<Boolean>
 
     /**
+     * When true (default), the string decryptor class is injected into the output.
+     * Set to false on modules whose dependency already contains the decryptor
+     * (e.g. Android modules where :core's JAR already carries it) to avoid
+     * 'Type defined multiple times' R8 errors.
+     */
+    @get:Input
+    @get:Optional
+    abstract val injectDecryptor: Property<Boolean>
+
+    /**
      * When true, CryptorFilesWrapper and its inner class are injected into the output
      * with KEY_0..KEY_3 patched to the real values.
      */
@@ -106,13 +116,19 @@ abstract class EncryptClassesTask : DefaultTask() {
         // Also exclude the dynamically-derived decryptor class by its obfuscated name
         val allExclusions = extra + decryptClass
 
-        output.deleteRecursively()
-        output.mkdirs()
-
         // Collect all source directories to process
         val sources = mutableListOf<File>()
         inputDirs.files.filter { it.isDirectory }.forEach { sources.add(it) }
         inputDir.orNull?.asFile?.takeIf { it.isDirectory && it !in sources }?.let { sources.add(it) }
+
+        // In-place mode: when output directory equals one of the source directories,
+        // modify class files directly without deleting anything.
+        val inPlace = sources.any { it.canonicalPath == output.canonicalPath }
+
+        if (!inPlace) {
+            output.deleteRecursively()
+            output.mkdirs()
+        }
 
         // Hoist constant: evaluated once per task run, not once per file in the parallel loop.
         val doEncrypt = encryptStrings.orElse(true).get()
@@ -122,30 +138,30 @@ abstract class EncryptClassesTask : DefaultTask() {
                 .parallelStream()
                 .forEach { classFile ->
                     val relative = classFile.relativeTo(inputRoot)
-                    val dest = File(output, relative.path)
-                    if (dest.exists()) return@forEach
-                    dest.parentFile?.mkdirs()
+                    val dest = if (inPlace) classFile else File(output, relative.path)
+                    if (!inPlace && dest.exists()) return@forEach
+                    if (!inPlace) dest.parentFile?.mkdirs()
 
                     if (classFile.extension != "class") {
-                        classFile.copyTo(dest)
+                        if (!inPlace) classFile.copyTo(dest)
                         return@forEach
                     }
 
                     val internalName = relative.path.removeSuffix(".class").replace(File.separatorChar, '/')
                     if (isExcluded(internalName, allExclusions)) {
-                        classFile.copyTo(dest)
+                        if (!inPlace) classFile.copyTo(dest)
                         return@forEach
                     }
 
-                    val bytes = if (doEncrypt)
-                        transformClass(classFile.readBytes(), key, decryptClass, decryptMethod)
-                    else
-                        classFile.readBytes()
-                    dest.writeBytes(bytes)
+                    if (doEncrypt) {
+                        dest.writeBytes(transformClass(classFile.readBytes(), key, decryptClass, decryptMethod))
+                    } else if (!inPlace) {
+                        classFile.copyTo(dest)
+                    }
                 }
         }
 
-        if (encryptStrings.orElse(true).get()) {
+        if (encryptStrings.orElse(true).get() && injectDecryptor.orElse(true).get()) {
             injectDecryptor(output, key, decryptClass, decryptMethod)
         }
 
@@ -201,23 +217,10 @@ abstract class EncryptClassesTask : DefaultTask() {
                 return
             }
 
-            // AES-128-CTR string encryption.
-            // IV = first 8 bytes of murmur64(plaintext), repeated to 16 bytes.
-            // Stored as ISO-8859-1 chars: [8-byte IV prefix][ciphertext].
-            val plainBytes = value.toByteArray(Charsets.UTF_8)
-            val ivLong     = XorEncryptor.murmur64(plainBytes)
-            val ivPrefix   = ByteArray(8) { i -> ((ivLong ushr (i * 8)) and 0xFF).toByte() }
-            val iv         = ivPrefix + ivPrefix              // pad to 16 bytes
-
-            val masterKey  = AesFileEncryptor.deriveAesKey(key)
-            val cipher     = javax.crypto.Cipher.getInstance("AES/CTR/NoPadding")
-            cipher.init(
-                javax.crypto.Cipher.ENCRYPT_MODE,
-                javax.crypto.spec.SecretKeySpec(masterKey, "AES"),
-                javax.crypto.spec.IvParameterSpec(iv)
-            )
-            val cipherBytes    = cipher.doFinal(plainBytes)
-            val encryptedString = String(ivPrefix + cipherBytes, Charsets.ISO_8859_1)
+            // XOR string encryption — same-size output (plain + 8B salt). No
+            // 65535-byte CONSTANT_Utf8 limit risk, no javax.crypto dependency.
+            val saltBytes = XorEncryptor.encrypt(value, key)
+            val encryptedString = String(saltBytes, Charsets.ISO_8859_1)
 
             mv.visitLdcInsn(encryptedString)
             mv.visitMethodInsn(
@@ -274,17 +277,13 @@ abstract class EncryptClassesTask : DefaultTask() {
     }
 
     /**
-     * Patches KEY_0..KEY_3 into StringDecryptor's static initialiser.
+     * Patches KEY into StringDecryptor's static initializer.
      *
-     * Derives the 16-byte AES master key from [key], splits it into four Ints,
-     * and injects each as an XOR of two unrelated-looking constants (arithmetic veil)
-     * so no Int literal in the bytecode directly reveals a key part.
+     * The Kotlin compiler omits LCONST_0; PUTSTATIC KEY when the placeholder is 0L
+     * (because 0 is already the field default), so we unconditionally prepend
+     * LDC key; PUTSTATIC KEY to <clinit>.
      */
     private fun patchDecryptorKey(bytes: ByteArray, key: Long): ByteArray {
-        val masterKey = AesFileEncryptor.deriveAesKey(key)
-        val parts     = AesFileEncryptor.splitKey(masterKey)
-        val veils     = intArrayOf(0x7A3F1B2C, 0xC4E8D059.toInt(), 0x51A6F390.toInt(), 0x8B2D7E4F.toInt())
-
         val reader = ClassReader(bytes)
         val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
 
@@ -298,12 +297,8 @@ abstract class EncryptClassesTask : DefaultTask() {
                     return object : MethodVisitor(ASM9, mv) {
                         override fun visitCode() {
                             super.visitCode()
-                            for (i in 0..3) {
-                                mv.visitLdcInsn(veils[i])
-                                mv.visitLdcInsn(veils[i] xor parts[i])
-                                mv.visitInsn(IXOR)
-                                mv.visitFieldInsn(PUTSTATIC, "StringDecryptor", "KEY_$i", "I")
-                            }
+                            mv.visitLdcInsn(key)
+                            mv.visitFieldInsn(PUTSTATIC, "StringDecryptor", "KEY", "J")
                         }
                     }
                 }
@@ -337,16 +332,22 @@ abstract class EncryptClassesTask : DefaultTask() {
                 }
             }
 
-        // ---- CryptorAudioWrapper: rename only (no ENABLED field) ----
+        // ---- CryptorAudioWrapper: rename self AND update CryptorFilesWrapper cross-reference ----
+        // CryptorAudioWrapper.keyHash() calls CryptorFilesWrapper.masterKey(). If we only rename
+        // CryptorAudioWrapper → audioName but leave the internal CryptorFilesWrapper reference
+        // intact, R8 reports "Missing class CryptorFilesWrapper" and the app crashes with
+        // NoClassDefFoundError on the first newSound()/newMusic() call.
         val audioBytes = classLoader.getResourceAsStream("CryptorAudioWrapper.class")?.readBytes()
         if (audioBytes != null) {
-            File(outputDir, "$audioName.class").writeBytes(
-                renameClass(audioBytes, "CryptorAudioWrapper", audioName))
+            val renamed = renameClass(audioBytes, "CryptorAudioWrapper", audioName)
+            val crossFixed = renameClass(renamed, "CryptorFilesWrapper", filesName)
+            File(outputDir, "$audioName.class").writeBytes(crossFixed)
         }
         val audioCompanion = classLoader.getResourceAsStream("CryptorAudioWrapper\$Companion.class")?.readBytes()
         if (audioCompanion != null) {
-            File(outputDir, "${audioName}\$Companion.class").writeBytes(
-                renameClass(audioCompanion, "CryptorAudioWrapper", audioName))
+            val renamed = renameClass(audioCompanion, "CryptorAudioWrapper", audioName)
+            val crossFixed = renameClass(renamed, "CryptorFilesWrapper", filesName)
+            File(outputDir, "${audioName}\$Companion.class").writeBytes(crossFixed)
         }
 
         // ---- AesFileEncryptor: copy as-is (used by CryptorFileHandle at runtime) ----
@@ -357,20 +358,33 @@ abstract class EncryptClassesTask : DefaultTask() {
     }
 
     /**
-     * Renames all occurrences of [oldName] to [newName] inside [bytes] using ClassRemapper.
-     * Updates the class declaration, field descriptors, method descriptors, and all INVOKESTATIC /
-     * GETSTATIC / PUTSTATIC / NEW references consistently.
+     * Renames all occurrences of [oldName] to [newName] inside [bytes].
+     *
+     * Uses a simple byte-level replacement — no ASM required.
+     * Requires [newName] to be the SAME byte length as [oldName] so
+     * that constant-pool offsets are preserved.
      */
     private fun renameClass(bytes: ByteArray, oldName: String, newName: String): ByteArray {
-        val reader = ClassReader(bytes)
-        val writer = ClassWriter(0)
-        val remapper = object : Remapper() {
-            override fun map(internalName: String): String =
-                if (internalName.startsWith(oldName)) internalName.replace(oldName, newName)
-                else internalName
+        val oldBytes = oldName.toByteArray(Charsets.UTF_8)
+        val newBytes = newName.toByteArray(Charsets.UTF_8)
+        require(oldBytes.size == newBytes.size) {
+            "renameClass: oldName '$oldName' (${oldBytes.size} bytes) and newName '$newName' (${newBytes.size} bytes) must have the same UTF-8 byte length"
         }
-        reader.accept(ClassRemapper(writer, remapper), 0)
-        return writer.toByteArray()
+        val result = bytes.copyOf()
+        var i = 0
+        while (i <= result.size - oldBytes.size) {
+            var match = true
+            for (j in oldBytes.indices) {
+                if (result[i + j] != oldBytes[j]) { match = false; break }
+            }
+            if (match) {
+                System.arraycopy(newBytes, 0, result, i, newBytes.size)
+                i += oldBytes.size
+            } else {
+                i++
+            }
+        }
+        return result
     }
 
     private fun patchCryptorFilesWrapperKeys(bytes: ByteArray, key: Long): ByteArray {

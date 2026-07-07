@@ -5,7 +5,7 @@ plugins {
 }
 
 group   = "com.github.MRZ07"
-version = "v1.9.5"
+version = "v1.9.11"
 
 repositories {
     mavenCentral()
@@ -28,6 +28,7 @@ kotlin {
 dependencies {
     implementation("org.ow2.asm:asm:9.7")
     implementation("org.ow2.asm:asm-commons:9.7")
+    compileOnly(gradleApi())
     compileOnly("com.android.tools.build:gradle:8.3.0")
     compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.0")
     compileOnly("com.badlogicgames.gdx:gdx:1.14.0")
