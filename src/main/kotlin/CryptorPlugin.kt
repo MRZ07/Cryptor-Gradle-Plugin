@@ -190,7 +190,7 @@ class CryptorPlugin : Plugin<Project> {
                             val encryptedDir = task.outputDir.get().asFile
                             val targetDir = compileDirProvider.get().asFile
                             if (!encryptedDir.exists()) return@doLast
-                            encryptedDir.walkTopDown().filter { it.isFile }.forEach { cls ->
+                    encryptedDir.walkTopDown().filter { it.isFile && it.extension == "class" }.forEach { cls ->
                                 val rel = cls.relativeTo(encryptedDir)
                                 val dest = File(targetDir, rel.path)
                                 dest.parentFile?.mkdirs()
@@ -369,7 +369,7 @@ class CryptorPlugin : Plugin<Project> {
                     val decryptName = task.decryptorClassName.orNull ?: ""
                     val filesName = CryptorPlugin.deriveFilesWrapperName(key)
                     val audioName = CryptorPlugin.deriveAudioWrapperName(key)
-                    encryptedDir.walkTopDown().filter { it.isFile }.forEach { cls ->
+                    encryptedDir.walkTopDown().filter { it.isFile && it.extension == "class" }.forEach { cls ->
                         val rel = cls.relativeTo(encryptedDir)
                         val name = cls.name
                         val isInjected = name == "AesFileEncryptor.class" ||
@@ -378,7 +378,7 @@ class CryptorPlugin : Plugin<Project> {
                             name.startsWith(audioName) ||
                             name.startsWith("CryptorFilesWrapper") ||
                             name.startsWith("CryptorAudioWrapper")
-                        if (isInjected && !isPrimary) return@forEach
+                        if (!isPrimary) return@forEach
                         val dest = File(compileDir, rel.path)
                         dest.parentFile?.mkdirs()
                         cls.copyTo(dest, overwrite = true)
