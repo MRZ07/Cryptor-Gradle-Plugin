@@ -39,21 +39,24 @@ class CryptorPlugin : Plugin<Project> {
             }
         }
 
-        /** Derive a 6-letter obfuscated class name for CryptorFilesWrapper from the key. */
-        fun deriveFilesWrapperName(key: Long): String = buildString(6) {
+        /** Derive a 19-letter obfuscated class name for CryptorFilesWrapper from the key.
+         *  Must be exactly 19 chars to match the original "CryptorFilesWrapper" length —
+         *  byte-level rename in EncryptClassesTask requires equal-length replacement. */
+        fun deriveFilesWrapperName(key: Long): String = buildString(19) {
             var k = key xor 0x5555555555555555L
-            repeat(6) {
+            repeat(19) {
                 append(NAME_CHARS[((k and 0xFFL).toInt() % 26 + 26) % 26])
-                k = k ushr 8
+                k = (k ushr 8) or ((k and 0xFFL) shl 56)  // rotate-right 8
             }
         }
 
-        /** Derive a 6-letter obfuscated class name for CryptorAudioWrapper from the key. */
-        fun deriveAudioWrapperName(key: Long): String = buildString(6) {
+        /** Derive a 19-letter obfuscated class name for CryptorAudioWrapper from the key.
+         *  Must be exactly 19 chars to match the original "CryptorAudioWrapper" length. */
+        fun deriveAudioWrapperName(key: Long): String = buildString(19) {
             var k = key xor -0x5555555555555556L  // == key XOR 0xAAAAAAAAAAAAAAAA
-            repeat(6) {
+            repeat(19) {
                 append(NAME_CHARS[((k and 0xFFL).toInt() % 26 + 26) % 26])
-                k = k ushr 8
+                k = (k ushr 8) or ((k and 0xFFL) shl 56)  // rotate-right 8
             }
         }
     }
@@ -68,11 +71,15 @@ class CryptorPlugin : Plugin<Project> {
         project.plugins.withId("com.android.application") { applyAndroid(project, extension) }
         project.plugins.withId("com.android.library")     { applyAndroid(project, extension) }
 
-        // JVM / Desktop modules: wire after evaluation (when no Android plugin present)
-        project.afterEvaluate {
+        // JVM / Desktop modules: wire after ALL projects are evaluated so that
+        // subproject plugin checks (hasPlugin) see the fully-resolved state.
+        // Using projectsEvaluated instead of afterEvaluate because the latter
+        // fires per-project — core may evaluate before lwjgl3, causing lwjgl3's
+        // Cryptor plugin to be invisible during core's afterEvaluate.
+        project.gradle.projectsEvaluated {
             if (!extension.enabled.get()) {
                 project.logger.lifecycle("[Cryptor] enabled = false — all encryption skipped.")
-                return@afterEvaluate
+                return@projectsEvaluated
             }
             val hasAndroid = project.plugins.hasPlugin("com.android.application") ||
                              project.plugins.hasPlugin("com.android.library")
@@ -87,8 +94,9 @@ class CryptorPlugin : Plugin<Project> {
         val androidComponents = project.extensions
             .findByType(AndroidComponentsExtension::class.java) ?: return
 
-        // Accumulate the variant names that need asset encryption.
-        // Populated during onVariants, consumed in the afterEvaluate below.
+        // Track all variant names for class encryption wiring.
+        // assetVariants is a subset — only variants that need asset encryption.
+        val allVariants = mutableListOf<String>()
         val assetVariants = mutableListOf<String>()
 
         androidComponents.onVariants { variant ->
@@ -106,9 +114,11 @@ class CryptorPlugin : Plugin<Project> {
                 task.decryptorMethodName.set(extension.key.map { k -> deriveMethodName(k) })
                 task.encryptStrings.set(extension.encryptStrings)
                 task.runtimeDecryptorHash.set(runtimeDecryptorHash())
-                // Never inject wrappers into the Android module — CryptorFilesWrapper and
-                // CryptorAudioWrapper are already injected into core's compiled classes by
-                // the JVM wiring path. DEX-merging core again would cause duplicate class errors.
+                // Decryptor + wrappers are injected by the JVM path on the :core module.
+                // Injecting them again on Android would cause duplicate class errors
+                // (R8: "Type ieuufi is defined multiple times") because :core's JAR
+                // already contains them and Android depends on :core.
+                task.injectDecryptor.set(false)
                 task.injectFilesWrapper.set(false)
                 task.outputDir.set(
                     project.layout.buildDirectory.dir("encryptedClasses/$variantName")
@@ -125,6 +135,8 @@ class CryptorPlugin : Plugin<Project> {
             }.configureEach { compileTask ->
                 compileTask.finalizedBy(encryptTask)
             }
+
+            allVariants += variantName
 
             if (extension.encryptAssets.get()) {
                 assetVariants += variantName
@@ -161,7 +173,38 @@ class CryptorPlugin : Plugin<Project> {
         //   so our afterEvaluate callback is queued AFTER AGP's. By the time ours executes,
         //   all AGP tasks exist and tasks.named() is safe.
         project.afterEvaluate {
-            if (!extension.enabled.get() || !extension.encryptAssets.get()) return@afterEvaluate
+            if (!extension.enabled.get()) return@afterEvaluate
+
+            // Wire class encryption: set inputDir to each variant's compile output
+            // and copy encrypted/injected classes back so the dex step picks them up.
+            for (variantName in allVariants) {
+                val compileTask = project.tasks.findByName("compile${variantName}Kotlin")
+                    ?: project.tasks.findByName("compile${variantName}JavaWithJavac")
+                    ?: continue
+
+                val compileDirProvider = resolveDestinationDirProvider(compileTask)
+                if (compileDirProvider != null) {
+                    project.tasks.named("encryptStrings${variantName}", EncryptClassesTask::class.java) { task ->
+                        task.inputDir.set(compileDirProvider)
+                        task.doLast {
+                            val encryptedDir = task.outputDir.get().asFile
+                            val targetDir = compileDirProvider.get().asFile
+                            if (!encryptedDir.exists()) return@doLast
+                            encryptedDir.walkTopDown().filter { it.isFile }.forEach { cls ->
+                                val rel = cls.relativeTo(encryptedDir)
+                                val dest = File(targetDir, rel.path)
+                                dest.parentFile?.mkdirs()
+                                cls.copyTo(dest, overwrite = true)
+                            }
+                        }
+                    }
+                } else {
+                    project.logger.warn("[Cryptor] Could not find compile output for variant $variantName — classes will not be encrypted.")
+                }
+            }
+
+            // Wire asset encryption (in-place via doLast on mergeXxxAssets)
+            if (!extension.encryptAssets.get()) return@afterEvaluate
 
             for (variantName in assetVariants) {
                 val lcVariant = variantName.replaceFirstChar { it.lowercaseChar() }
@@ -307,6 +350,39 @@ class CryptorPlugin : Plugin<Project> {
 
         compileTasks.forEach { it.finalizedBy(encryptTask) }
 
+        // Copy encrypted/injected class files back to their source compile-output
+        // directories so that non-JAR consumers (e.g. RoboVM, IDE run configs)
+        // also see the transformed classes.
+        // Injected class names (AesFileEncryptor, wrappers, decryptor) are ONLY copied
+        // to the FIRST compileDir (the project's own output). Copying them to other
+        // subproject dirs would cause duplicate entries when those subprojects build
+        // their own JARs (e.g. :ios:jar picking up AesFileEncryptor.class from :core
+        // plus its own compile dir).
+        val firstCompileDir = compileDirs.firstOrNull()
+        encryptTask.configure { task ->
+            val decryptName = task.decryptorClassName.orNull ?: ""
+            compileDirs.forEach { compileDir ->
+                val isPrimary = compileDir == firstCompileDir
+                task.doLast {
+                    val encryptedDir = task.outputDir.get().asFile
+                    if (!encryptedDir.exists()) return@doLast
+                    encryptedDir.walkTopDown().filter { it.isFile }.forEach { cls ->
+                        val rel = cls.relativeTo(encryptedDir)
+                        val name = cls.name
+                        // Injected classes: only copy to the project's own compile output.
+                        val isInjected = name == "AesFileEncryptor.class" ||
+                            name == "$decryptName.class" ||
+                            name.startsWith("CryptorFilesWrapper") ||
+                            name.startsWith("CryptorAudioWrapper")
+                        if (isInjected && !isPrimary) return@forEach
+                        val dest = File(compileDir, rel.path)
+                        dest.parentFile?.mkdirs()
+                        cls.copyTo(dest, overwrite = true)
+                    }
+                }
+            }
+        }
+
         // Register the asset-encryption task.
         // Raw assets intentionally remain in resources.srcDirs so that IDE runs and the
         // Gradle `run` task can load them without CryptorFilesWrapper being active.
@@ -333,6 +409,9 @@ class CryptorPlugin : Plugin<Project> {
         project.plugins.withId("java") {
             project.tasks.named("jar", org.gradle.api.tasks.bundling.Jar::class.java) { jar ->
                 jar.dependsOn(encryptTask)
+                // Non-core JVM modules (ios, lwjgl3) depend on :core which already
+                // carries AesFileEncryptor.class and the injected wrappers. Excluding
+                // duplicates from the encrypt-task output keeps the JAR clean.
                 jar.from(encryptTask.flatMap { it.outputDir })
                 jar.exclude { details ->
                     compileDirs.any { dir -> details.file.startsWith(dir) }
@@ -355,6 +434,15 @@ class CryptorPlugin : Plugin<Project> {
                 }
             }
         }
+    }
+
+    /**
+     * Resolves the compile-output directory as a [Provider] from a task.
+     */
+    private fun resolveDestinationDirProvider(task: Task): org.gradle.api.file.DirectoryProperty? {
+        (task as? AbstractCompile)?.destinationDirectory?.let { return it }
+        (task as? KotlinJvmCompile)?.destinationDirectory?.let { return it }
+        return null
     }
 
     /**
