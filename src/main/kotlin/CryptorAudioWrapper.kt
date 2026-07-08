@@ -6,6 +6,7 @@ import com.badlogic.gdx.files.FileHandle
 import com.badlogic.gdx.utils.GdxRuntimeException
 import java.io.File
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -46,6 +47,19 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
             currentDir.mkdirs()
             return currentDir
         }
+
+        internal fun buildCacheFileName(path: String): String {
+            val normalized = path.replace('\\', '/')
+            val digest = MessageDigest
+                .getInstance("SHA-256")
+                .digest(normalized.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+            val ext = normalized.substringAfterLast('.', "")
+                .takeIf { it.isNotEmpty() && !it.contains('/') }
+                ?.let { ".${it.lowercase()}" }
+                ?: ""
+            return "cryptor_${digest}${ext}"
+        }
     }
 
     override fun newSound(fileHandle: FileHandle): Sound =
@@ -65,8 +79,7 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
             throw GdxRuntimeException("Decrypted audio file is empty: $path")
 
         val audioDir = resolveAudioDir()
-        val safePath = path.replace('/', '_').replace('\\', '_')
-        val file     = File(audioDir, "cryptor_${safePath}")
+        val file     = File(audioDir, buildCacheFileName(path))
 
         FileOutputStream(file).use { fos -> fos.write(bytes); fos.flush(); fos.fd.sync() }
 
