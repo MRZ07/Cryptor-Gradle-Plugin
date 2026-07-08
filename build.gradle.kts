@@ -32,6 +32,13 @@ dependencies {
     compileOnly("com.android.tools.build:gradle:8.3.0")
     compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.0")
     compileOnly("com.badlogicgames.gdx:gdx:1.14.0")
+
+    testImplementation(kotlin("test"))
+    testImplementation("com.badlogicgames.gdx:gdx:1.14.0")
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 gradlePlugin {
