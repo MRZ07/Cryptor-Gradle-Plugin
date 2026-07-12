@@ -371,8 +371,9 @@ class CryptorPlugin : Plugin<Project> {
 
         // Encrypted class files are copied back to every source compile-output
         // directory so that non-JAR consumers (e.g. RoboVM) also see transformed classes.
-        // The encrypt task is triggered by jar (via dependsOn), NOT via finalizedBy on compile
-        // tasks — that would force encryption on every IDE run, slowing down debug iteration.
+        // The encrypt task depends on the compile tasks (ordering) and is triggered by jar
+        // (via dependsOn), NOT via finalizedBy — that would force encryption on every IDE
+        // run, slowing down debug iteration.
         //
         // Inject classes (AesFileEncryptor, wrappers, decryptor) are ONLY copied to the
         // FIRST compileDir (the project's own output). Copying them to subproject dirs would
@@ -407,6 +408,8 @@ class CryptorPlugin : Plugin<Project> {
                 }
             }
         }
+
+        encryptTask.configure { it.dependsOn(compileTasks) }
 
         // Register the asset-encryption task.
         // Raw assets intentionally remain in resources.srcDirs so that IDE runs and the
