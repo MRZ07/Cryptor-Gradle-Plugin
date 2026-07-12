@@ -369,46 +369,15 @@ class CryptorPlugin : Plugin<Project> {
             )
         }
 
-        // Encrypted class files are copied back to every source compile-output
-        // directory so that non-JAR consumers (e.g. RoboVM) also see transformed classes.
         // The encrypt task depends on the compile tasks (ordering) and is triggered by jar
         // (via dependsOn), NOT via finalizedBy — that would force encryption on every IDE
         // run, slowing down debug iteration.
         //
-        // Inject classes (AesFileEncryptor, wrappers, decryptor) are ONLY copied to the
-        // FIRST compileDir (the project's own output). Copying them to subproject dirs would
-        // pollute those subprojects' compile dirs with classes they don't own, causing
-        // potential duplicate entries when two Cryptor-enabled projects share a dependency
-        // (e.g. :ios and :lwjgl3 both depending on :core).
-        val firstCompileDir = compileDirs.firstOrNull()
-        encryptTask.configure { task ->
-            compileDirs.forEach { compileDir ->
-                val isPrimary = compileDir == firstCompileDir
-                task.doLast {
-                    val encryptedDir = task.outputDir.get().asFile
-                    if (!encryptedDir.exists()) return@doLast
-                    val key = task.encryptionKey.get()
-                    val decryptName = task.decryptorClassName.orNull ?: ""
-                    val filesName = CryptorPlugin.deriveFilesWrapperName(key)
-                    val audioName = CryptorPlugin.deriveAudioWrapperName(key)
-                    encryptedDir.walkTopDown().filter { it.isFile && it.extension == "class" }.forEach { cls ->
-                        val name = cls.name
-                        val isInjected = name == "AesFileEncryptor.class" ||
-                            name == "$decryptName.class" ||
-                            name.startsWith(filesName) ||
-                            name.startsWith(audioName) ||
-                            name.startsWith("CryptorFilesWrapper") ||
-                            name.startsWith("CryptorAudioWrapper")
-                        if (!isPrimary && isInjected) return@forEach
-                        val rel = cls.relativeTo(encryptedDir)
-                        val dest = File(compileDir, rel.path)
-                        dest.parentFile?.mkdirs()
-                        cls.copyTo(dest, overwrite = true)
-                    }
-                }
-            }
-        }
-
+        // Encrypted classes live in outputDir only. The jar task includes outputDir and
+        // excludes compile dirs, so release builds pick up encrypted classes while IDE runs
+        // use the unencrypted originals from compile dirs. We deliberately do NOT copy
+        // encrypted classes back into compile dirs — that would modify Gradle-tracked
+        // task outputs, causing strict output-tracking failures under Gradle 9+.
         encryptTask.configure { it.dependsOn(compileTasks) }
 
         // Register the asset-encryption task.
