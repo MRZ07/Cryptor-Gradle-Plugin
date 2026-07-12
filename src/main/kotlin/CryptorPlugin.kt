@@ -284,6 +284,11 @@ class CryptorPlugin : Plugin<Project> {
     // JVM / Desktop wiring
     // -------------------------------------------------------------------------
     private fun wireJvm(project: Project, extension: CryptorExtension) {
+        if (extension.skipDebug.get()) {
+            project.logger.lifecycle("[Cryptor] skipDebug = true — JVM encryption skipped.")
+            return
+        }
+
         val kotlinTask = project.tasks.findByName("compileKotlin")
         val javaTask   = project.tasks.findByName("compileJava") as? AbstractCompile
 
@@ -369,16 +374,16 @@ class CryptorPlugin : Plugin<Project> {
             )
         }
 
-        compileTasks.forEach { it.finalizedBy(encryptTask) }
-
-        // Copy encrypted/injected class files back to their source compile-output
-        // directories so that non-JAR consumers (e.g. RoboVM, IDE run configs)
-        // also see the transformed classes.
-        // Injected class names (AesFileEncryptor, wrappers, decryptor) are ONLY copied
-        // to the FIRST compileDir (the project's own output). Copying them to other
-        // subproject dirs would cause duplicate entries when those subprojects build
-        // their own JARs (e.g. :ios:jar picking up AesFileEncryptor.class from :core
-        // plus its own compile dir).
+        // Encrypted class files are copied back to every source compile-output
+        // directory so that non-JAR consumers (e.g. RoboVM) also see transformed classes.
+        // The encrypt task is triggered by jar (via dependsOn), NOT via finalizedBy on compile
+        // tasks — that would force encryption on every IDE run, slowing down debug iteration.
+        //
+        // Inject classes (AesFileEncryptor, wrappers, decryptor) are ONLY copied to the
+        // FIRST compileDir (the project's own output). Copying them to subproject dirs would
+        // pollute those subprojects' compile dirs with classes they don't own, causing
+        // potential duplicate entries when two Cryptor-enabled projects share a dependency
+        // (e.g. :ios and :lwjgl3 both depending on :core).
         val firstCompileDir = compileDirs.firstOrNull()
         encryptTask.configure { task ->
             compileDirs.forEach { compileDir ->
@@ -391,7 +396,6 @@ class CryptorPlugin : Plugin<Project> {
                     val filesName = CryptorPlugin.deriveFilesWrapperName(key)
                     val audioName = CryptorPlugin.deriveAudioWrapperName(key)
                     encryptedDir.walkTopDown().filter { it.isFile && it.extension == "class" }.forEach { cls ->
-                        val rel = cls.relativeTo(encryptedDir)
                         val name = cls.name
                         val isInjected = name == "AesFileEncryptor.class" ||
                             name == "$decryptName.class" ||
@@ -399,7 +403,8 @@ class CryptorPlugin : Plugin<Project> {
                             name.startsWith(audioName) ||
                             name.startsWith("CryptorFilesWrapper") ||
                             name.startsWith("CryptorAudioWrapper")
-                        if (!isPrimary) return@forEach
+                        if (!isPrimary && isInjected) return@forEach
+                        val rel = cls.relativeTo(encryptedDir)
                         val dest = File(compileDir, rel.path)
                         dest.parentFile?.mkdirs()
                         cls.copyTo(dest, overwrite = true)
