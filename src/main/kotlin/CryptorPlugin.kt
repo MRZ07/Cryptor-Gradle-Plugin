@@ -284,11 +284,6 @@ class CryptorPlugin : Plugin<Project> {
     // JVM / Desktop wiring
     // -------------------------------------------------------------------------
     private fun wireJvm(project: Project, extension: CryptorExtension) {
-        if (extension.skipDebug.get()) {
-            project.logger.lifecycle("[Cryptor] skipDebug = true — JVM encryption skipped.")
-            return
-        }
-
         val kotlinTask = project.tasks.findByName("compileKotlin")
         val javaTask   = project.tasks.findByName("compileJava") as? AbstractCompile
 
