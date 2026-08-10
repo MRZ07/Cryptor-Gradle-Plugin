@@ -134,6 +134,17 @@ abstract class EncryptClassesTask : DefaultTask() {
         // Hoist constant: evaluated once per task run, not once per file in the parallel loop.
         val doEncrypt = encryptStrings.orElse(true).get()
 
+        // Pre-pass: build the project's own class hierarchy (name→super/interfaces) from all
+        // input class files. COMPUTE_FRAMES resolves frame merges against this map instead of
+        // Class.forName, which would fail for libGDX etc. (compileOnly on the plugin classpath).
+        val hierarchy = if (doEncrypt) {
+            EncryptClassesTask.buildHierarchyMap(
+                sources.flatMap { it.walkTopDown().filter { f -> f.isFile && f.extension == "class" }.toList() }
+            )
+        } else {
+            emptyMap()
+        }
+
         sources.forEach { inputRoot ->
             inputRoot.walkTopDown().filter { it.isFile }.toList()
                 .parallelStream()
@@ -155,7 +166,7 @@ abstract class EncryptClassesTask : DefaultTask() {
                     }
 
                     if (doEncrypt) {
-                        dest.writeBytes(transformClass(classFile.readBytes(), key, decryptClass, decryptMethod))
+                        dest.writeBytes(transformClass(classFile.readBytes(), key, decryptClass, decryptMethod, hierarchy))
                     } else if (!inPlace) {
                         classFile.copyTo(dest)
                     }
@@ -181,33 +192,121 @@ abstract class EncryptClassesTask : DefaultTask() {
     // -----------------------------------------------------------------------
     private fun transformClass(
         bytes: ByteArray, key: Long,
-        decryptorClass: String, decryptorMethod: String
-    ): ByteArray = EncryptClassesTask.transformClass(bytes, key, decryptorClass, decryptorMethod)
+        decryptorClass: String, decryptorMethod: String,
+        hierarchy: Map<String, ClassHierarchyInfo> = emptyMap()
+    ): ByteArray = EncryptClassesTask.transformClass(bytes, key, decryptorClass, decryptorMethod, hierarchy)
 
     companion object {
         internal fun transformClass(
             bytes: ByteArray, key: Long,
-            decryptorClass: String, decryptorMethod: String
+            decryptorClass: String, decryptorMethod: String,
+            hierarchy: Map<String, ClassHierarchyInfo> = emptyMap()
         ): ByteArray {
             val reader = ClassReader(bytes)
-            // COMPUTE_FRAMES is required: the indy→StringBuilder rewrite adds new locals, and
-            // without recomputing the StackMapTable the frames at branch targets go stale
-            // (VerifyError "Inconsistent stackmap frames"). COMPUTE_MAXS alone only recomputes
-            // max_stack/max_locals, leaving the original frames in place.
-            val writer = object : ClassWriter(ClassWriter.COMPUTE_MAXS or ClassWriter.COMPUTE_FRAMES) {
-                override fun getCommonSuperClass(type1: String, type2: String): String {
-                    // COMPUTE_FRAMES needs the class hierarchy, but the plugin runs before
-                    // dependencies are on the classpath (e.g. libGDX is compileOnly). Fall back
-                    // to java/lang/Object instead of throwing TypeNotPresentException.
-                    return try {
-                        super.getCommonSuperClass(type1, type2)
-                    } catch (_: RuntimeException) {
-                        "java/lang/Object"
-                    }
+            val needsFrameComputation = hasStringConcatIndy(bytes)
+            val writer = if (needsFrameComputation) {
+                // COMPUTE_FRAMES is required for classes that contain a StringConcatFactory
+                // indy: the rewrite adds new locals, so without recomputing the StackMapTable
+                // the frames at branch targets go stale (VerifyError "Inconsistent stackmap
+                // frames"). For all other classes frames are preserved verbatim via the
+                // copy-mode writer — the ldc→ldc+INVOKESTATIC substitution is stack-neutral
+                // and does not invalidate them.
+                object : ClassWriter(ClassWriter.COMPUTE_MAXS or ClassWriter.COMPUTE_FRAMES) {
+                    override fun getCommonSuperClass(type1: String, type2: String): String =
+                        resolveCommonSuperClass(type1, type2, hierarchy)
+                }
+            } else {
+                ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
+            }
+            reader.accept(
+                EncryptingClassVisitor(writer, key, decryptorClass, decryptorMethod),
+                if (needsFrameComputation) ClassReader.EXPAND_FRAMES else 0
+            )
+            return writer.toByteArray()
+        }
+
+        /**
+         * True when [bytes] reference `StringConcatFactory` as an invokedynamic bootstrap owner.
+         * Only such classes need frame recomputation after the indy rewrite.
+         */
+        private fun hasStringConcatIndy(bytes: ByteArray): Boolean {
+            val marker = "java/lang/invoke/StringConcatFactory".toByteArray(Charsets.UTF_8)
+            if (marker.size > bytes.size) return false
+            outer@ for (i in 0..bytes.size - marker.size) {
+                for (j in marker.indices) {
+                    if (bytes[i + j] != marker[j]) continue@outer
+                }
+                return true
+            }
+            return false
+        }
+
+        /** Minimal per-class superclass metadata captured during the hierarchy pre-pass. */
+        internal data class ClassHierarchyInfo(
+            val superName: String?,
+            val interfaces: List<String>,
+            val isInterface: Boolean
+        )
+
+        /**
+         * Builds a class→superclass map from [classFiles] so `getCommonSuperClass` can resolve
+         * frame merges against the project's own classes (which are NOT on the plugin's
+         * classloader — libGDX etc. are compileOnly). Without this, COMPUTE_FRAMES would fall
+         * back to java/lang/Object for any two app classes and silently emit verifier-invalid
+         * frames when the merged value is later used through a non-Object method.
+         */
+        internal fun buildHierarchyMap(classFiles: Iterable<File>): Map<String, ClassHierarchyInfo> {
+            val map = HashMap<String, ClassHierarchyInfo>()
+            for (file in classFiles) {
+                if (file.extension != "class") continue
+                try {
+                    ClassReader(file.readBytes()).accept(object : ClassVisitor(ASM9) {
+                        override fun visit(
+                            version: Int, access: Int, name: String,
+                            signature: String?, superName: String?, interfaces: Array<out String>?
+                        ) {
+                            map[name] = ClassHierarchyInfo(
+                                superName = superName,
+                                interfaces = interfaces?.toList() ?: emptyList(),
+                                isInterface = (access and Opcodes.ACC_INTERFACE) != 0
+                            )
+                        }
+                    }, ClassReader.SKIP_CODE or ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES)
+                } catch (_: RuntimeException) {
+                    // unreadable class → skip; it cannot contribute hierarchy info
                 }
             }
-            reader.accept(EncryptingClassVisitor(writer, key, decryptorClass, decryptorMethod), ClassReader.EXPAND_FRAMES)
-            return writer.toByteArray()
+            return map
+        }
+
+        /**
+         * Resolves the common superclass of [type1] and [type2] against the project's own class
+         * hierarchy. Falls back to java/lang/Object only when neither type is reachable through
+         * the map (library-only types we cannot introspect).
+         */
+        private fun resolveCommonSuperClass(
+            type1: String, type2: String, hierarchy: Map<String, ClassHierarchyInfo>
+        ): String {
+            if (type1 == type2) return type1
+            if (isSubtype(type2, type1, hierarchy)) return type1
+            if (isSubtype(type1, type2, hierarchy)) return type2
+            var current = type1
+            while (true) {
+                val info = hierarchy[current] ?: return "java/lang/Object"
+                val superName = info.superName ?: return "java/lang/Object"
+                if (isSubtype(type2, superName, hierarchy)) return superName
+                current = superName
+            }
+        }
+
+        /** True when [sub] is assignable to [sup] per the [hierarchy] map. */
+        private fun isSubtype(
+            sub: String, sup: String, hierarchy: Map<String, ClassHierarchyInfo>
+        ): Boolean {
+            if (sub == sup) return true
+            val info = hierarchy[sub] ?: return false
+            if (info.superName != null && isSubtype(info.superName, sup, hierarchy)) return true
+            return info.interfaces.any { isSubtype(it, sup, hierarchy) }
         }
 
         private class EncryptingClassVisitor(

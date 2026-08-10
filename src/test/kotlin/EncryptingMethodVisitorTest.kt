@@ -2,7 +2,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 import org.objectweb.asm.*
-import java.lang.reflect.Method
+import java.io.File
 
 class EncryptingMethodVisitorTest {
 
@@ -136,9 +136,21 @@ class EncryptingMethodVisitorTest {
         mv.visitMaxs(0, 0)
         mv.visitEnd()
         cw.visitEnd()
-        // arg-count mismatch (recipe expects 2 args, desc has 1) → fail-open, no crash
+        // arg-count mismatch (recipe expects 2 args, desc has 1) → fail-open, no crash.
+        // The original invokedynamic must survive unchanged: the transform did NOT rewrite the
+        // indy away. Verify by checking the StringConcatFactory BSM owner is still referenced
+        // (a rewritten site would have replaced it with the StringBuilder block) and the class
+        // is still structurally loadable.
         val transformed = EncryptClassesTask.transformClass(cw.toByteArray(), key, "StringDecryptor", "decrypt")
-        assertTrue(transformed.size > 0)
+        val text = String(transformed, Charsets.ISO_8859_1)
+        assertTrue(text.contains("StringConcatFactory"), "fail-open must keep the original indy (BSM owner still present)")
+        val loader = object : ClassLoader() {
+            override fun findClass(name: String): Class<*> =
+                if (name == "Fixture3") defineClass(name, transformed, 0, transformed.size)
+                else super.findClass(name)
+        }
+        val c = loader.loadClass("Fixture3")
+        assertEquals(1, c.declaredMethods.size)
     }
 
     @Test
@@ -248,5 +260,210 @@ class EncryptingMethodVisitorTest {
         val c = loader.loadClass("FixtureLoop")
         val m = c.getMethod("run", Int::class.javaPrimitiveType, String::class.java)
         assertEquals("a=0;a=1;a=2;", m.invoke(null, 3, "a"))
+    }
+
+    @Test
+    fun `float arg`() {
+        val c = fixture("ratio=\u0001", "(F)Ljava/lang/String;")
+        assertEquals("ratio=1.5", invoke(c, arrayOf(1.5f)))
+    }
+
+    @Test
+    fun `double arg`() {
+        val c = fixture("val=\u0001", "(D)Ljava/lang/String;")
+        assertEquals("val=2.25", invoke(c, arrayOf(2.25)))
+    }
+
+    @Test
+    fun `boolean arg`() {
+        val c = fixture("flag=\u0001", "(Z)Ljava/lang/String;")
+        assertEquals("flag=true", invoke(c, arrayOf(true)))
+    }
+
+    @Test
+    fun `char arg`() {
+        val c = fixture("grade=\u0001", "(C)Ljava/lang/String;")
+        assertEquals("grade=A", invoke(c, arrayOf('A')))
+    }
+
+    @Test
+    fun `rewrite inside try catch with exception handler`() {
+        val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES)
+        cw.visit(Opcodes.V11, Opcodes.ACC_PUBLIC, "FixtureTry", null, "java/lang/Object", null)
+        val mv = cw.visitMethod(
+            Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "run",
+            "(IZ)Ljava/lang/String;", null, null
+        )
+        val bsm = Handle(
+            Opcodes.H_INVOKESTATIC,
+            "java/lang/invoke/StringConcatFactory",
+            "makeConcatWithConstants",
+            "(Ljava/lang/invoke/MethodHandles\$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
+            false
+        )
+        val start = Label()
+        val end = Label()
+        val handler = Label()
+        mv.visitTryCatchBlock(start, end, handler, "java/lang/ArithmeticException")
+        mv.visitLabel(start)
+        mv.visitVarInsn(Opcodes.ILOAD, 0)
+        mv.visitInvokeDynamicInsn("makeConcatWithConstants", "(I)Ljava/lang/String;", bsm, "v=\u0001")
+        mv.visitInsn(Opcodes.ARETURN)
+        mv.visitLabel(end)
+        mv.visitLabel(handler)
+        mv.visitLdcInsn("boom")
+        mv.visitInsn(Opcodes.ARETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+        cw.visitEnd()
+
+        StringDecryptor.KEY = key
+        val transformed = EncryptClassesTask.transformClass(cw.toByteArray(), key, "StringDecryptor", "decrypt")
+        val loader = object : ClassLoader() {
+            override fun findClass(name: String): Class<*> =
+                if (name == "FixtureTry") defineClass(name, transformed, 0, transformed.size)
+                else super.findClass(name)
+        }
+        val c = loader.loadClass("FixtureTry")
+        val m = c.getMethod("run", Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+        assertEquals("v=99", m.invoke(null, 99, true))
+    }
+
+    @Test
+    fun `oversized literal falls back to plaintext LDC via 65535 guard`() {
+        val big = "x".repeat(40000)
+        val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES)
+        cw.visit(Opcodes.V11, Opcodes.ACC_PUBLIC, "FixtureBig", null, "java/lang/Object", null)
+        val mv = cw.visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "run", "()Ljava/lang/String;", null, null)
+        val bsm = Handle(
+            Opcodes.H_INVOKESTATIC,
+            "java/lang/invoke/StringConcatFactory",
+            "makeConcatWithConstants",
+            "(Ljava/lang/invoke/MethodHandles\$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
+            false
+        )
+        mv.visitInvokeDynamicInsn("makeConcatWithConstants", "()Ljava/lang/String;", bsm, big)
+        mv.visitInsn(Opcodes.ARETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+        cw.visitEnd()
+
+        StringDecryptor.KEY = key
+        val transformed = EncryptClassesTask.transformClass(cw.toByteArray(), key, "StringDecryptor", "decrypt")
+        val loader = object : ClassLoader() {
+            override fun findClass(name: String): Class<*> =
+                if (name == "FixtureBig") defineClass(name, transformed, 0, transformed.size)
+                else super.findClass(name)
+        }
+        val c = loader.loadClass("FixtureBig")
+        val m = c.getMethod("run")
+        assertEquals(big, m.invoke(null))
+    }
+
+    // Builds a class named [name] extending [superName] with a no-arg constructor and,
+    // when [body] is provided, a public `method()Ljava/lang/String;` whose bytecode is [body].
+    private fun buildSimpleClass(
+        name: String, superName: String,
+        methodBody: ((MethodVisitor) -> Unit)? = null
+    ): ByteArray {
+        val cw = ClassWriter(ClassWriter.COMPUTE_MAXS)
+        cw.visit(Opcodes.V11, Opcodes.ACC_PUBLIC, name, null, superName, null)
+        val init = cw.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null)
+        init.visitVarInsn(Opcodes.ALOAD, 0)
+        init.visitMethodInsn(Opcodes.INVOKESPECIAL, superName, "<init>", "()V", false)
+        init.visitInsn(Opcodes.RETURN)
+        init.visitMaxs(0, 0)
+        init.visitEnd()
+        if (methodBody != null) {
+            val m = cw.visitMethod(Opcodes.ACC_PUBLIC, "method", "()Ljava/lang/String;", null, null)
+            methodBody(m)
+            m.visitMaxs(0, 0)
+            m.visitEnd()
+        }
+        cw.visitEnd()
+        return cw.toByteArray()
+    }
+
+    private fun writeClass(name: String, bytes: ByteArray): File {
+        val f = File.createTempFile("cls-$name", ".class")
+        f.deleteOnExit()
+        f.writeBytes(bytes)
+        return f
+    }
+
+    @Test
+    fun `frame merge of two app classes resolves common superclass via hierarchy map`() {
+        // Base has method()Ljava/lang/String; returning "AB"; A and B extend Base.
+        val baseBytes = buildSimpleClass("Base", "java/lang/Object") { mv ->
+            mv.visitLdcInsn("AB")
+            mv.visitInsn(Opcodes.ARETURN)
+        }
+        val aBytes = buildSimpleClass("A", "Base")
+        val bBytes = buildSimpleClass("B", "Base")
+
+        // runner: (boolean) -> "tag=" + (flag ? new A() : new B()).method()
+        // Fixture frames are built with an Object fallback (A/B aren't loadable here); the
+        // transform's COMPUTE_FRAMES then re-derives them via the hierarchy map → Base.
+        val cw = object : ClassWriter(ClassWriter.COMPUTE_FRAMES) {
+            override fun getCommonSuperClass(type1: String, type2: String): String =
+                "java/lang/Object"
+        }
+        cw.visit(Opcodes.V11, Opcodes.ACC_PUBLIC, "Runner", null, "java/lang/Object", null)
+        val mv = cw.visitMethod(Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "run", "(Z)Ljava/lang/String;", null, null)
+        val bsm = Handle(
+            Opcodes.H_INVOKESTATIC,
+            "java/lang/invoke/StringConcatFactory",
+            "makeConcatWithConstants",
+            "(Ljava/lang/invoke/MethodHandles\$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
+            false
+        )
+        val elseL = Label()
+        val mergeL = Label()
+        mv.visitLdcInsn("tag=")
+        mv.visitVarInsn(Opcodes.ILOAD, 0)
+        mv.visitJumpInsn(Opcodes.IFEQ, elseL)
+        mv.visitTypeInsn(Opcodes.NEW, "A")
+        mv.visitInsn(Opcodes.DUP)
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "A", "<init>", "()V", false)
+        mv.visitJumpInsn(Opcodes.GOTO, mergeL)
+        mv.visitLabel(elseL)
+        mv.visitTypeInsn(Opcodes.NEW, "B")
+        mv.visitInsn(Opcodes.DUP)
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "B", "<init>", "()V", false)
+        mv.visitLabel(mergeL)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "Base", "method", "()Ljava/lang/String;", false)
+        mv.visitInvokeDynamicInsn("makeConcatWithConstants", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;", bsm, "\u0001\u0001")
+        mv.visitInsn(Opcodes.ARETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+        cw.visitEnd()
+        val runnerBytes = cw.toByteArray()
+
+        val hierarchy = EncryptClassesTask.buildHierarchyMap(
+            listOf(
+                writeClass("Base", baseBytes),
+                writeClass("A", aBytes),
+                writeClass("B", bBytes),
+                writeClass("Runner", runnerBytes),
+            )
+        )
+        assertEquals("Base", hierarchy["A"]?.superName)
+        assertEquals("Base", hierarchy["B"]?.superName)
+
+        StringDecryptor.KEY = key
+        val transformed = EncryptClassesTask.transformClass(runnerBytes, key, "StringDecryptor", "decrypt", hierarchy)
+        val loader = object : ClassLoader() {
+            override fun findClass(name: String): Class<*> = when (name) {
+                "Base" -> defineClass(name, baseBytes, 0, baseBytes.size)
+                "A" -> defineClass(name, aBytes, 0, aBytes.size)
+                "B" -> defineClass(name, bBytes, 0, bBytes.size)
+                "Runner" -> defineClass(name, transformed, 0, transformed.size)
+                else -> super.findClass(name)
+            }
+        }
+        val c = loader.loadClass("Runner")
+        val m = c.getMethod("run", Boolean::class.javaPrimitiveType)
+        assertEquals("tag=AB", m.invoke(null, true))
+        assertEquals("tag=AB", m.invoke(null, false))
     }
 }
