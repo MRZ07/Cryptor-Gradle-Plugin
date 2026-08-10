@@ -7,6 +7,7 @@ import org.gradle.api.tasks.*
 import org.objectweb.asm.*
 import org.objectweb.asm.Opcodes.*
 import org.objectweb.asm.commons.ClassRemapper
+import org.objectweb.asm.commons.LocalVariablesSorter
 import org.objectweb.asm.commons.Remapper
 import java.io.File
 
@@ -205,13 +206,17 @@ abstract class EncryptClassesTask : DefaultTask() {
                 access: Int, name: String, descriptor: String,
                 signature: String?, exceptions: Array<out String>?
             ): MethodVisitor {
-                val mv = super.visitMethod(access, name, descriptor, signature, exceptions)
-                return EncryptingMethodVisitor(mv, key, decryptorClass, decryptorMethod)
+                val sorter = LocalVariablesSorter(
+                    access, descriptor,
+                    super.visitMethod(access, name, descriptor, signature, exceptions)
+                )
+                return EncryptingMethodVisitor(sorter, sorter, key, decryptorClass, decryptorMethod)
             }
         }
 
         private class EncryptingMethodVisitor(
             mv: MethodVisitor,
+            private val sorter: LocalVariablesSorter,
             private val key: Long,
             private val decryptorClass: String,
             private val decryptorMethod: String
@@ -238,6 +243,65 @@ abstract class EncryptClassesTask : DefaultTask() {
                 emitEncryptedLdc(mv, value)
             }
 
+            /**
+             * Rewrites a `StringConcatFactory` invokedynamic site (Kotlin string templates
+             * compile to these) into a stack-neutral `StringBuilder` block whose literal
+             * segments go through [emitEncryptedLdc]. Malformed recipes fall back to the
+             * original invokedynamic (fail-open).
+             */
+            override fun visitInvokeDynamicInsn(
+                name: String, descriptor: String, bsm: Handle, vararg bsmArgs: Any?
+            ) {
+                if (bsm.owner != "java/lang/invoke/StringConcatFactory" ||
+                    bsm.name !in setOf("makeConcatWithConstants", "makeConcat")
+                ) {
+                    super.visitInvokeDynamicInsn(name, descriptor, bsm, *bsmArgs)
+                    return
+                }
+
+                val argTypes = Type.getArgumentTypes(descriptor)
+                val recipe = when (bsm.name) {
+                    "makeConcat" -> "\u0001".repeat(argTypes.size)
+                    else -> bsmArgs.getOrNull(0) as? String ?: return run {
+                        super.visitInvokeDynamicInsn(name, descriptor, bsm, *bsmArgs)
+                    }
+                }
+                val constants = bsmArgs.drop(1)
+                val segments = parseRecipe(recipe, argTypes.size, constants.size) ?: return run {
+                    super.visitInvokeDynamicInsn(name, descriptor, bsm, *bsmArgs)
+                }
+
+                // 1. Save args: descriptor order argTypes[0..n-1]; on stack argTypes[n-1] deepest.
+                val slots = argTypes.map { sorter.newLocal(it) }
+                for (i in argTypes.indices.reversed()) {
+                    mv.visitVarInsn(argTypes[i].getOpcode(Opcodes.ISTORE), slots[i])
+                }
+
+                // 2. StringBuilder
+                mv.visitTypeInsn(Opcodes.NEW, "java/lang/StringBuilder")
+                mv.visitInsn(Opcodes.DUP)
+                mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false)
+
+                // 3. Segments
+                for (seg in segments) when (seg) {
+                    is Segment.Literal -> {
+                        emitEncryptedLdc(mv, seg.text)
+                        emitAppend(mv, "Ljava/lang/String;")
+                    }
+                    is Segment.Arg -> {
+                        mv.visitVarInsn(argTypes[seg.index].getOpcode(Opcodes.ILOAD), slots[seg.index])
+                        emitAppend(mv, appendDescriptorFor(argTypes[seg.index]))
+                    }
+                    is Segment.Const -> {
+                        emitEncryptedLdc(mv, java.lang.String.valueOf(constants[seg.index]))
+                        emitAppend(mv, "Ljava/lang/String;")
+                    }
+                }
+
+                // 4. toString
+                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false)
+            }
+
             private fun emitEncryptedLdc(mv: MethodVisitor, value: String) {
                 val saltBytes = XorEncryptor.encrypt(value, key)
                 val encryptedString = String(saltBytes, Charsets.ISO_8859_1)
@@ -254,6 +318,54 @@ abstract class EncryptClassesTask : DefaultTask() {
                     false
                 )
             }
+        }
+
+        // -----------------------------------------------------------------------
+        // StringConcatFactory recipe parsing + StringBuilder append helpers
+        // -----------------------------------------------------------------------
+        private sealed class Segment {
+            class Literal(val text: String) : Segment()
+            class Arg(val index: Int) : Segment()
+            class Const(val index: Int) : Segment()
+        }
+
+        private fun parseRecipe(
+            recipe: String, argCount: Int, constCount: Int
+        ): List<Segment>? {
+            val out = mutableListOf<Segment>()
+            val run = StringBuilder()
+            var argIdx = 0
+            var constIdx = 0
+            for (c in recipe) when (c) {
+                '\u0001' -> {
+                    if (run.isNotEmpty()) { out += Segment.Literal(run.toString()); run.setLength(0) }
+                    out += Segment.Arg(argIdx++)
+                }
+                '\u0002' -> {
+                    if (run.isNotEmpty()) { out += Segment.Literal(run.toString()); run.setLength(0) }
+                    if (constIdx >= constCount) return null
+                    out += Segment.Const(constIdx++)
+                }
+                else -> run.append(c)
+            }
+            if (run.isNotEmpty()) out += Segment.Literal(run.toString())
+            return if (argIdx == argCount && constIdx == constCount) out else null
+        }
+
+        private fun appendDescriptorFor(type: Type): String = when (type.sort) {
+            Type.INT, Type.BYTE, Type.SHORT -> "(I)Ljava/lang/StringBuilder;"
+            Type.LONG -> "(J)Ljava/lang/StringBuilder;"
+            Type.FLOAT -> "(F)Ljava/lang/StringBuilder;"
+            Type.DOUBLE -> "(D)Ljava/lang/StringBuilder;"
+            Type.CHAR -> "(C)Ljava/lang/StringBuilder;"
+            Type.BOOLEAN -> "(Z)Ljava/lang/StringBuilder;"
+            else -> "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+        }
+
+        private fun emitAppend(mv: MethodVisitor, argDesc: String) {
+            mv.visitMethodInsn(
+                INVOKEVIRTUAL, "java/lang/StringBuilder", "append", argDesc, false
+            )
         }
     }
 
