@@ -288,6 +288,9 @@ class EncryptingMethodVisitorTest {
 
     @Test
     fun `rewrite inside try catch with exception handler`() {
+        // (int, boolean): when flag is true, 10/0 throws ArithmeticException → handler returns
+        // "boom" (exercising the encrypted ldc inside the handler); otherwise returns the
+        // template result from inside the try block. The handler is a branch target with a frame.
         val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES)
         cw.visit(Opcodes.V11, Opcodes.ACC_PUBLIC, "FixtureTry", null, "java/lang/Object", null)
         val mv = cw.visitMethod(
@@ -304,8 +307,16 @@ class EncryptingMethodVisitorTest {
         val start = Label()
         val end = Label()
         val handler = Label()
+        val noThrow = Label()
         mv.visitTryCatchBlock(start, end, handler, "java/lang/ArithmeticException")
         mv.visitLabel(start)
+        mv.visitVarInsn(Opcodes.ILOAD, 1)
+        mv.visitJumpInsn(Opcodes.IFEQ, noThrow)
+        mv.visitLdcInsn(10)
+        mv.visitInsn(Opcodes.ICONST_0)
+        mv.visitInsn(Opcodes.IDIV)
+        mv.visitInsn(Opcodes.POP)
+        mv.visitLabel(noThrow)
         mv.visitVarInsn(Opcodes.ILOAD, 0)
         mv.visitInvokeDynamicInsn("makeConcatWithConstants", "(I)Ljava/lang/String;", bsm, "v=\u0001")
         mv.visitInsn(Opcodes.ARETURN)
@@ -326,7 +337,8 @@ class EncryptingMethodVisitorTest {
         }
         val c = loader.loadClass("FixtureTry")
         val m = c.getMethod("run", Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
-        assertEquals("v=99", m.invoke(null, 99, true))
+        assertEquals("v=99", m.invoke(null, 99, false))
+        assertEquals("boom", m.invoke(null, 99, true))
     }
 
     @Test

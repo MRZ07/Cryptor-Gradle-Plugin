@@ -212,8 +212,19 @@ abstract class EncryptClassesTask : DefaultTask() {
                 // copy-mode writer — the ldc→ldc+INVOKESTATIC substitution is stack-neutral
                 // and does not invalidate them.
                 object : ClassWriter(ClassWriter.COMPUTE_MAXS or ClassWriter.COMPUTE_FRAMES) {
-                    override fun getCommonSuperClass(type1: String, type2: String): String =
-                        resolveCommonSuperClass(type1, type2, hierarchy)
+                    override fun getCommonSuperClass(type1: String, type2: String): String {
+                        // 1. Resolve against the project's own hierarchy first (app classes are
+                        //    not on the plugin classloader — libGDX etc. are compileOnly).
+                        val projectCommon = resolveCommonSuperClass(type1, type2, hierarchy)
+                        if (projectCommon != "java/lang/Object") return projectCommon
+                        // 2. Fall back to ASM's Class.forName resolution (JDK/library types such
+                        //    as ArrayList|LinkedList → AbstractList), then to Object on failure.
+                        return try {
+                            super.getCommonSuperClass(type1, type2)
+                        } catch (_: RuntimeException) {
+                            "java/lang/Object"
+                        }
+                    }
                 }
             } else {
                 ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
@@ -244,8 +255,7 @@ abstract class EncryptClassesTask : DefaultTask() {
         /** Minimal per-class superclass metadata captured during the hierarchy pre-pass. */
         internal data class ClassHierarchyInfo(
             val superName: String?,
-            val interfaces: List<String>,
-            val isInterface: Boolean
+            val interfaces: List<String>
         )
 
         /**
@@ -267,8 +277,7 @@ abstract class EncryptClassesTask : DefaultTask() {
                         ) {
                             map[name] = ClassHierarchyInfo(
                                 superName = superName,
-                                interfaces = interfaces?.toList() ?: emptyList(),
-                                isInterface = (access and Opcodes.ACC_INTERFACE) != 0
+                                interfaces = interfaces?.toList() ?: emptyList()
                             )
                         }
                     }, ClassReader.SKIP_CODE or ClassReader.SKIP_DEBUG or ClassReader.SKIP_FRAMES)
