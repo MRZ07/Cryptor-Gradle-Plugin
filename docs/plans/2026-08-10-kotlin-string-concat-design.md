@@ -53,9 +53,14 @@ literal segment passes through the *existing* encrypted-LDC path.
 
 1. **Universal** — fixes Kotlin templates *and* Java `+` concatenation (both emit
    `StringConcatFactory` indy on JDK 9+), plus any precompiled dependency in the app.
-2. **Pool fully cleaned** — after the rewrite no instruction references the bootstrap method, so
-   ASM drops the `BootstrapMethods` entry including the plaintext recipe string. The literal text
-   is gone from the class, not just obfuscated.
+2. **Pool fully cleaned** — two mechanisms combine. (a) The rewrite removes the only reference to
+   the bootstrap method, so the `BootstrapMethods` entry is dropped. (b) **Verified during
+   prototyping:** ASM's reader-copy mode (`ClassWriter(reader, COMPUTE_MAXS)`) *keeps* dead
+   constant-pool entries — the recipe string and old plaintext ldcs survive as unreferenced Utf8s.
+   Switching to a non-copy writer (`ClassWriter(COMPUTE_MAXS)` + `ClassReader.EXPAND_FRAMES`)
+   rebuilds the pool from references only, pruning those dead entries. The literal text is then
+   gone from the class entirely, not just from the obfuscated JAR (ProGuard would also strip the
+   dead entries in the final artifact).
 3. **No toolchain coupling** — works identically for desktop (ProGuard) and Android (R8 + D8
    desugaring); no reliance on Kotlin compiler flags.
 4. **Crash-safe by construction** — see Failure handling below.
@@ -80,11 +85,20 @@ containing a literal `\n`.
 
 ### Per-segment codegen
 
-Recipe parsed into segments; each emits code into a `LocalVariablesSorter`-wrapped method visitor:
+The method is buffered into an ASM `MethodNode` (tree API); the rewrite is applied in `visitEnd`
+once the full instruction list and `maxLocals` are known. `LocalVariablesSorter` was rejected
+during integration: its mid-method `newLocal` renumbers pre-existing locals inconsistently and
+produces verifier-invalid StackMapTable frames for methods that already have branch targets
+(ProGuard `Value in slot N of type SOME_REFERENCE expected, but found: i`). Fresh locals are
+instead allocated starting at the method's original `maxLocals`, so they can never collide with
+the pre-existing local space; the downstream writer uses `COMPUTE_FRAMES` to rebuild all frames
+from the rewritten code.
 
 1. **Prologue** — every dynamic argument is on the operand stack at the indy site. Save each into
-   a fresh local via `LocalVariablesSorter.newLocal(Type)`, storing in reverse order (last param
-   is deepest on the stack).
+   a fresh local starting at `maxLocals` (each local's slot count = its `Type.size`). Arg
+   `argTypes[n-1]` is on **top**, so store in reverse index order (`argTypes.indices.reversed()`):
+   pop arg0→`slots[0]` last, meaning each slot holds its own argument and loads can proceed in
+   forward order.
 2. `NEW java/lang/StringBuilder;` `DUP;` `INVOKESPECIAL <init>()V`
 3. For each segment:
    - **Literal run** → `LDC(encrypted)` + `invokestatic <decryptor>.<decrypt>(String)String` +
@@ -190,8 +204,10 @@ encryption + 65535-guard + decryptor-call emission.
 
 ## Open items (resolved during implementation)
 
-- `LocalVariablesSorter` must wrap the method visitor *before* `EncryptingMethodVisitor` so both
-  new locals and remapped originals share one index space. (Choice: create the sorter in
-  `EncryptingClassVisitor.visitMethod`).
+- ~~`LocalVariablesSorter` must wrap the method visitor before `EncryptingMethodVisitor`~~ →
+  **rejected during integration** (see Per-segment codegen): mid-method `newLocal` renumbers
+  existing locals inconsistently and breaks StackMapTable frames for methods with branch targets.
+  Replaced with the `MethodNode` tree API allocating fresh locals above `maxLocals` +
+  `COMPUTE_FRAMES`.
 - `\2` constants: enforce the same count invariant the JDK enforces; mismatch → fail-open.
 - Long templates with many segments: fine, each literal is independently guarded.
