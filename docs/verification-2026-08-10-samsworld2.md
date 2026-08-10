@@ -43,3 +43,20 @@ No `VerifyError`, no `NoClassDefFoundError`, no `BootstrapMethodError`.
   methods with branch targets; fixed via ASM tree API allocating fresh locals above maxLocals).
 - SamsWorld2 worktree: `e8809699a chore: bump Cryptor plugin to v1.9.21`,
   `d9f5ecaee perf: reduce proguard optimization passes from 8 to 2`.
+
+---
+
+## v1.9.22 re-verification (2026-08-10)
+
+Follow-up release fixing the final-review finding: `getCommonSuperClass` now resolves frame
+merges via (1) the project hierarchy map, (2) ASM's Class.forName fallback, (3) Object.
+`COMPUTE_FRAMES` runs only on classes containing a StringConcatFactory indy.
+
+- Plugin tests: 19/19 pass (added frame-merge hierarchy resolution, float/double/boolean/char
+  args, try/catch with executed handler, oversized-literal 65535-guard fallback).
+- SamsWorld2 `proguard` worktree bumped to v1.9.22; `lwjgl3:proguardJar` rebuilt
+  (SamsWorld2-obfuscated-0.1.jar, modified 2026-08-10 16:47).
+- Leak grep: template hits = 0, SMOKE_ = 0 (identical commands as above).
+- Smoke test: 45s crash-free run, no verifier/classloading/bootstrap errors.
+- SamsWorld2 main + SamsWorld pushed; feature worktrees (proguard-fork, mp-fixes, lanternfish)
+  bumped locally (mp-fixes swept-in refactor separated back into uncommitted work).
