@@ -190,8 +190,8 @@ abstract class EncryptClassesTask : DefaultTask() {
             decryptorClass: String, decryptorMethod: String
         ): ByteArray {
             val reader = ClassReader(bytes)
-            val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
-            reader.accept(EncryptingClassVisitor(writer, key, decryptorClass, decryptorMethod), 0)
+            val writer = ClassWriter(ClassWriter.COMPUTE_MAXS)
+            reader.accept(EncryptingClassVisitor(writer, key, decryptorClass, decryptorMethod), ClassReader.EXPAND_FRAMES)
             return writer.toByteArray()
         }
 
