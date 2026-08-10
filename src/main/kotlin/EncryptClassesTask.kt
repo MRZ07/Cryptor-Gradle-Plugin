@@ -181,74 +181,79 @@ abstract class EncryptClassesTask : DefaultTask() {
     private fun transformClass(
         bytes: ByteArray, key: Long,
         decryptorClass: String, decryptorMethod: String
-    ): ByteArray {
-        val reader = ClassReader(bytes)
-        val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
-        reader.accept(EncryptingClassVisitor(writer, key, decryptorClass, decryptorMethod), 0)
-        return writer.toByteArray()
-    }
+    ): ByteArray = EncryptClassesTask.transformClass(bytes, key, decryptorClass, decryptorMethod)
 
-    private class EncryptingClassVisitor(
-        cv: ClassVisitor,
-        private val key: Long,
-        private val decryptorClass: String,
-        private val decryptorMethod: String
-    ) : ClassVisitor(ASM9, cv) {
-
-        override fun visitMethod(
-            access: Int, name: String, descriptor: String,
-            signature: String?, exceptions: Array<out String>?
-        ): MethodVisitor {
-            val mv = super.visitMethod(access, name, descriptor, signature, exceptions)
-            return EncryptingMethodVisitor(mv, key, decryptorClass, decryptorMethod)
+    companion object {
+        internal fun transformClass(
+            bytes: ByteArray, key: Long,
+            decryptorClass: String, decryptorMethod: String
+        ): ByteArray {
+            val reader = ClassReader(bytes)
+            val writer = ClassWriter(reader, ClassWriter.COMPUTE_MAXS)
+            reader.accept(EncryptingClassVisitor(writer, key, decryptorClass, decryptorMethod), 0)
+            return writer.toByteArray()
         }
-    }
 
-    private class EncryptingMethodVisitor(
-        mv: MethodVisitor,
-        private val key: Long,
-        private val decryptorClass: String,
-        private val decryptorMethod: String
-    ) : MethodVisitor(ASM9, mv) {
+        private class EncryptingClassVisitor(
+            cv: ClassVisitor,
+            private val key: Long,
+            private val decryptorClass: String,
+            private val decryptorMethod: String
+        ) : ClassVisitor(ASM9, cv) {
 
-        /** Modified-UTF-8 byte count for an ISO-8859-1 [s] without encoding it. */
-        private fun modifiedUtf8Length(s: String): Int {
-            var len = 0
-            for (c in s) {
-                len += when {
-                    c.code in 0x0001..0x007F -> 1
-                    c.code == 0x0000 || c.code in 0x0080..0x07FF -> 2
-                    else -> 3
+            override fun visitMethod(
+                access: Int, name: String, descriptor: String,
+                signature: String?, exceptions: Array<out String>?
+            ): MethodVisitor {
+                val mv = super.visitMethod(access, name, descriptor, signature, exceptions)
+                return EncryptingMethodVisitor(mv, key, decryptorClass, decryptorMethod)
+            }
+        }
+
+        private class EncryptingMethodVisitor(
+            mv: MethodVisitor,
+            private val key: Long,
+            private val decryptorClass: String,
+            private val decryptorMethod: String
+        ) : MethodVisitor(ASM9, mv) {
+
+            /** Modified-UTF-8 byte count for an ISO-8859-1 [s] without encoding it. */
+            private fun modifiedUtf8Length(s: String): Int {
+                var len = 0
+                for (c in s) {
+                    len += when {
+                        c.code in 0x0001..0x007F -> 1
+                        c.code == 0x0000 || c.code in 0x0080..0x07FF -> 2
+                        else -> 3
+                    }
                 }
-            }
-            return len
-        }
-
-        override fun visitLdcInsn(value: Any?) {
-            if (value !is String) {
-                super.visitLdcInsn(value)
-                return
+                return len
             }
 
-            // XOR string encryption — output = 8B salt + plaintext-sized payload.
-            val saltBytes = XorEncryptor.encrypt(value, key)
-            val encryptedString = String(saltBytes, Charsets.ISO_8859_1)
-
-            // Guard: CONSTANT_Utf8 has a 65535-byte limit. Encrypted bytes >= 0x80
-            // become 2 bytes in modified UTF-8. Falls back to plaintext if exceeded.
-            if (modifiedUtf8Length(encryptedString) > 65535) {
-                mv.visitLdcInsn(value)
-                return
+            override fun visitLdcInsn(value: Any?) {
+                if (value !is String) {
+                    super.visitLdcInsn(value)
+                    return
+                }
+                emitEncryptedLdc(mv, value)
             }
 
-            mv.visitLdcInsn(encryptedString)
-            mv.visitMethodInsn(
-                INVOKESTATIC,
-                decryptorClass,
-                decryptorMethod,
-                "(Ljava/lang/String;)Ljava/lang/String;",
-                false
-            )
+            private fun emitEncryptedLdc(mv: MethodVisitor, value: String) {
+                val saltBytes = XorEncryptor.encrypt(value, key)
+                val encryptedString = String(saltBytes, Charsets.ISO_8859_1)
+                if (modifiedUtf8Length(encryptedString) > 65535) {
+                    mv.visitLdcInsn(value)
+                    return
+                }
+                mv.visitLdcInsn(encryptedString)
+                mv.visitMethodInsn(
+                    INVOKESTATIC,
+                    decryptorClass,
+                    decryptorMethod,
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    false
+                )
+            }
         }
     }
 
