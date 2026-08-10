@@ -190,4 +190,63 @@ class EncryptingMethodVisitorTest {
         assertEquals("x=42", m.invoke(null, 42, true))
         assertEquals("y=7", m.invoke(null, 7, false))
     }
+
+    @Test
+    fun `rewrite inside a loop with pre-existing locals`() {
+        // Loop with a template inside. The loop head is a StackMapTable frame target with
+        // pre-existing locals (StringBuilder + counter) that LocalVariablesSorter must remap
+        // around our new arg-save locals. Regression test for ProGuard's PartialEvaluator
+        // "Value in slot N of type SOME_REFERENCE expected, but found: i".
+        val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES)
+        cw.visit(Opcodes.V11, Opcodes.ACC_PUBLIC, "FixtureLoop", null, "java/lang/Object", null)
+        val mv = cw.visitMethod(
+            Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "run",
+            "(ILjava/lang/String;)Ljava/lang/String;", null, null
+        )
+        mv.visitTypeInsn(Opcodes.NEW, "java/lang/StringBuilder")
+        mv.visitInsn(Opcodes.DUP)
+        mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false)
+        mv.visitVarInsn(Opcodes.ASTORE, 3)
+        mv.visitInsn(Opcodes.ICONST_0)
+        mv.visitVarInsn(Opcodes.ISTORE, 4)
+        val loopHead = Label()
+        val exit = Label()
+        mv.visitLabel(loopHead)
+        mv.visitVarInsn(Opcodes.ILOAD, 4)
+        mv.visitVarInsn(Opcodes.ILOAD, 0)
+        mv.visitJumpInsn(Opcodes.IF_ICMPGE, exit)
+        mv.visitVarInsn(Opcodes.ALOAD, 3)
+        mv.visitVarInsn(Opcodes.ALOAD, 1)
+        mv.visitVarInsn(Opcodes.ILOAD, 4)
+        val bsm = Handle(
+            Opcodes.H_INVOKESTATIC,
+            "java/lang/invoke/StringConcatFactory",
+            "makeConcatWithConstants",
+            "(Ljava/lang/invoke/MethodHandles\$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
+            false
+        )
+        mv.visitInvokeDynamicInsn("makeConcatWithConstants", "(Ljava/lang/String;I)Ljava/lang/String;", bsm, "\u0001=\u0001;")
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false)
+        mv.visitInsn(Opcodes.POP)
+        mv.visitIincInsn(4, 1)
+        mv.visitJumpInsn(Opcodes.GOTO, loopHead)
+        mv.visitLabel(exit)
+        mv.visitVarInsn(Opcodes.ALOAD, 3)
+        mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false)
+        mv.visitInsn(Opcodes.ARETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+        cw.visitEnd()
+
+        StringDecryptor.KEY = key
+        val transformed = EncryptClassesTask.transformClass(cw.toByteArray(), key, "StringDecryptor", "decrypt")
+        val loader = object : ClassLoader() {
+            override fun findClass(name: String): Class<*> =
+                if (name == "FixtureLoop") defineClass(name, transformed, 0, transformed.size)
+                else super.findClass(name)
+        }
+        val c = loader.loadClass("FixtureLoop")
+        val m = c.getMethod("run", Int::class.javaPrimitiveType, String::class.java)
+        assertEquals("a=0;a=1;a=2;", m.invoke(null, 3, "a"))
+    }
 }
