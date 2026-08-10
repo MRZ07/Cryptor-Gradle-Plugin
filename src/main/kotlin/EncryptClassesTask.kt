@@ -190,7 +190,22 @@ abstract class EncryptClassesTask : DefaultTask() {
             decryptorClass: String, decryptorMethod: String
         ): ByteArray {
             val reader = ClassReader(bytes)
-            val writer = ClassWriter(ClassWriter.COMPUTE_MAXS)
+            // COMPUTE_FRAMES is required: the indy→StringBuilder rewrite adds new locals, and
+            // without recomputing the StackMapTable the frames at branch targets go stale
+            // (VerifyError "Inconsistent stackmap frames"). COMPUTE_MAXS alone only recomputes
+            // max_stack/max_locals, leaving the original frames in place.
+            val writer = object : ClassWriter(ClassWriter.COMPUTE_MAXS or ClassWriter.COMPUTE_FRAMES) {
+                override fun getCommonSuperClass(type1: String, type2: String): String {
+                    // COMPUTE_FRAMES needs the class hierarchy, but the plugin runs before
+                    // dependencies are on the classpath (e.g. libGDX is compileOnly). Fall back
+                    // to java/lang/Object instead of throwing TypeNotPresentException.
+                    return try {
+                        super.getCommonSuperClass(type1, type2)
+                    } catch (_: RuntimeException) {
+                        "java/lang/Object"
+                    }
+                }
+            }
             reader.accept(EncryptingClassVisitor(writer, key, decryptorClass, decryptorMethod), ClassReader.EXPAND_FRAMES)
             return writer.toByteArray()
         }
