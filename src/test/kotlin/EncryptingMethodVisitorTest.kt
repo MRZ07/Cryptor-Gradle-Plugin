@@ -140,4 +140,54 @@ class EncryptingMethodVisitorTest {
         val transformed = EncryptClassesTask.transformClass(cw.toByteArray(), key, "StringDecryptor", "decrypt")
         assertTrue(transformed.size > 0)
     }
+
+    @Test
+    fun `rewrite with control flow produces verifiable frames`() {
+        // Method with an if/else whose branches both contain templates. This produces
+        // StackMapTable frames at the branch targets — the rewrite adds new locals, so
+        // the frames MUST be recomputed (COMPUTE_FRAMES) or the class fails verification.
+        // Regression test for: VerifyError "Inconsistent stackmap frames" / ProGuard
+        // "Value in slot N of type SOME_REFERENCE expected, but found: i".
+        val cw = ClassWriter(ClassWriter.COMPUTE_FRAMES)
+        cw.visit(Opcodes.V11, Opcodes.ACC_PUBLIC, "FixtureFrame", null, "java/lang/Object", null)
+        val mv = cw.visitMethod(
+            Opcodes.ACC_PUBLIC or Opcodes.ACC_STATIC, "run",
+            "(IZ)Ljava/lang/String;", null, null
+        )
+        val bsm = Handle(
+            Opcodes.H_INVOKESTATIC,
+            "java/lang/invoke/StringConcatFactory",
+            "makeConcatWithConstants",
+            "(Ljava/lang/invoke/MethodHandles\$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
+            false
+        )
+        val elseLabel = Label()
+        val endLabel = Label()
+        mv.visitVarInsn(Opcodes.ILOAD, 1)
+        mv.visitJumpInsn(Opcodes.IFEQ, elseLabel)
+        mv.visitVarInsn(Opcodes.ILOAD, 0)
+        mv.visitInvokeDynamicInsn("makeConcatWithConstants", "(I)Ljava/lang/String;", bsm, "x=\u0001")
+        mv.visitInsn(Opcodes.ARETURN)
+        mv.visitLabel(elseLabel)
+        mv.visitVarInsn(Opcodes.ILOAD, 0)
+        mv.visitInvokeDynamicInsn("makeConcatWithConstants", "(I)Ljava/lang/String;", bsm, "y=\u0001")
+        mv.visitInsn(Opcodes.ARETURN)
+        mv.visitLabel(endLabel)
+        mv.visitInsn(Opcodes.RETURN)
+        mv.visitMaxs(0, 0)
+        mv.visitEnd()
+        cw.visitEnd()
+
+        StringDecryptor.KEY = key
+        val transformed = EncryptClassesTask.transformClass(cw.toByteArray(), key, "StringDecryptor", "decrypt")
+        val loader = object : ClassLoader() {
+            override fun findClass(name: String): Class<*> =
+                if (name == "FixtureFrame") defineClass(name, transformed, 0, transformed.size)
+                else super.findClass(name)
+        }
+        val c = loader.loadClass("FixtureFrame")
+        val m = c.getMethod("run", Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+        assertEquals("x=42", m.invoke(null, 42, true))
+        assertEquals("y=7", m.invoke(null, 7, false))
+    }
 }
