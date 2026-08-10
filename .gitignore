@@ -3,3 +3,6 @@ build/
 local.properties
 *.class
 .DS_Store
+
+# SDD scratch (subagent-driven development ledger)
+.superpowers/
