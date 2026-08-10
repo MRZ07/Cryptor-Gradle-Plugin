@@ -7,8 +7,8 @@ import org.gradle.api.tasks.*
 import org.objectweb.asm.*
 import org.objectweb.asm.Opcodes.*
 import org.objectweb.asm.commons.ClassRemapper
-import org.objectweb.asm.commons.LocalVariablesSorter
 import org.objectweb.asm.commons.Remapper
+import org.objectweb.asm.tree.*
 import java.io.File
 
 /**
@@ -221,118 +221,164 @@ abstract class EncryptClassesTask : DefaultTask() {
                 access: Int, name: String, descriptor: String,
                 signature: String?, exceptions: Array<out String>?
             ): MethodVisitor {
-                val sorter = LocalVariablesSorter(
-                    access, descriptor,
-                    super.visitMethod(access, name, descriptor, signature, exceptions)
-                )
-                return EncryptingMethodVisitor(sorter, sorter, key, decryptorClass, decryptorMethod)
+                // Buffer the whole method into a MethodNode first: the indy rewrite needs to
+                // allocate fresh locals above the method's existing maxLocals (LocalVariablesSorter
+                // is unusable here — it renumbers originals and produces verifier-invalid classes
+                // when the method already has branch frames). Tree rewrites are applied in
+                // visitEnd once the full instruction list and maxLocals are known.
+                val methodNode = MethodNode(access, name, descriptor, signature, exceptions)
+                return object : MethodVisitor(ASM9, methodNode) {
+                    override fun visitEnd() {
+                        rewriteMethod(
+                            methodNode, key, decryptorClass, decryptorMethod
+                        )
+                        methodNode.accept(
+                            cv.visitMethod(access, name, descriptor, signature, exceptions)
+                        )
+                    }
+                }
             }
         }
 
-        private class EncryptingMethodVisitor(
-            mv: MethodVisitor,
-            private val sorter: LocalVariablesSorter,
-            private val key: Long,
-            private val decryptorClass: String,
-            private val decryptorMethod: String
-        ) : MethodVisitor(ASM9, mv) {
+        /**
+         * Applies all string-encryption rewrites to a buffered [methodNode]:
+         *  1. Encrypt every String `ldc` (existing behavior).
+         *  2. Rewrite `StringConcatFactory` invokedynamic sites into stack-neutral
+         *     `StringBuilder` blocks (Kotlin templates / Java `+`).
+         * Fresh locals for saved indy args are allocated starting at the method's original
+         * `maxLocals`, so they never collide with the pre-existing local space and the
+         * StackMapTable frames stay valid (COMPUTE_FRAMES in the downstream writer rebuilds
+         * them from the rewritten code).
+         */
+        private fun rewriteMethod(
+            methodNode: MethodNode, key: Long,
+            decryptorClass: String, decryptorMethod: String
+        ) {
+            val insns = methodNode.instructions
+            var nextFreeLocal = methodNode.maxLocals
 
-            /** Modified-UTF-8 byte count for an ISO-8859-1 [s] without encoding it. */
-            private fun modifiedUtf8Length(s: String): Int {
-                var len = 0
-                for (c in s) {
-                    len += when {
-                        c.code in 0x0001..0x007F -> 1
-                        c.code == 0x0000 || c.code in 0x0080..0x07FF -> 2
-                        else -> 3
+            for (insn in insns.toArray()) {
+                when (insn) {
+                    is LdcInsnNode -> {
+                        if (insn.cst is String) {
+                            val replacement = InsnList()
+                            emitEncryptedLdc(replacement, insn.cst as String, key, decryptorClass, decryptorMethod)
+                            insns.insert(insn, replacement)
+                            insns.remove(insn)
+                        }
                     }
+                    is InvokeDynamicInsnNode -> {
+                        val bsm = insn.bsm
+                        if (bsm.owner == "java/lang/invoke/StringConcatFactory" &&
+                            bsm.name in setOf("makeConcatWithConstants", "makeConcat")
+                        ) {
+                            val replacement = rewriteIndy(insn, nextFreeLocal, key, decryptorClass, decryptorMethod)
+                            if (replacement != null) {
+                                insns.insert(insn, replacement)
+                                insns.remove(insn)
+                                nextFreeLocal = nextFreeLocal + Type.getArgumentTypes(insn.desc).sumOf { it.size }
+                            }
+                        }
+                    }
+                    else -> Unit
                 }
-                return len
             }
 
-            override fun visitLdcInsn(value: Any?) {
-                if (value !is String) {
-                    super.visitLdcInsn(value)
-                    return
-                }
-                emitEncryptedLdc(mv, value)
+            methodNode.maxLocals = nextFreeLocal
+        }
+
+        /** Emits `LDC(encrypted); INVOKESTATIC decryptor` (or plaintext LDC on the 65535 guard). */
+        private fun emitEncryptedLdc(
+            out: InsnList, value: String, key: Long,
+            decryptorClass: String, decryptorMethod: String
+        ) {
+            val saltBytes = XorEncryptor.encrypt(value, key)
+            val encryptedString = String(saltBytes, Charsets.ISO_8859_1)
+            if (modifiedUtf8Length(encryptedString) > 65535) {
+                out.add(LdcInsnNode(value))
+                return
             }
-
-            /**
-             * Rewrites a `StringConcatFactory` invokedynamic site (Kotlin string templates
-             * compile to these) into a stack-neutral `StringBuilder` block whose literal
-             * segments go through [emitEncryptedLdc]. Malformed recipes fall back to the
-             * original invokedynamic (fail-open).
-             */
-            override fun visitInvokeDynamicInsn(
-                name: String, descriptor: String, bsm: Handle, vararg bsmArgs: Any?
-            ) {
-                if (bsm.owner != "java/lang/invoke/StringConcatFactory" ||
-                    bsm.name !in setOf("makeConcatWithConstants", "makeConcat")
-                ) {
-                    super.visitInvokeDynamicInsn(name, descriptor, bsm, *bsmArgs)
-                    return
-                }
-
-                val argTypes = Type.getArgumentTypes(descriptor)
-                val recipe = when (bsm.name) {
-                    "makeConcat" -> "\u0001".repeat(argTypes.size)
-                    else -> bsmArgs.getOrNull(0) as? String ?: return run {
-                        super.visitInvokeDynamicInsn(name, descriptor, bsm, *bsmArgs)
-                    }
-                }
-                val constants = bsmArgs.drop(1)
-                val segments = parseRecipe(recipe, argTypes.size, constants.size) ?: return run {
-                    super.visitInvokeDynamicInsn(name, descriptor, bsm, *bsmArgs)
-                }
-
-                // 1. Save args: descriptor order argTypes[0..n-1]; on stack argTypes[n-1] deepest.
-                val slots = argTypes.map { sorter.newLocal(it) }
-                for (i in argTypes.indices.reversed()) {
-                    mv.visitVarInsn(argTypes[i].getOpcode(Opcodes.ISTORE), slots[i])
-                }
-
-                // 2. StringBuilder
-                mv.visitTypeInsn(Opcodes.NEW, "java/lang/StringBuilder")
-                mv.visitInsn(Opcodes.DUP)
-                mv.visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false)
-
-                // 3. Segments
-                for (seg in segments) when (seg) {
-                    is Segment.Literal -> {
-                        emitEncryptedLdc(mv, seg.text)
-                        emitAppend(mv, "(Ljava/lang/String;)Ljava/lang/StringBuilder;")
-                    }
-                    is Segment.Arg -> {
-                        mv.visitVarInsn(argTypes[seg.index].getOpcode(Opcodes.ILOAD), slots[seg.index])
-                        emitAppend(mv, appendDescriptorFor(argTypes[seg.index]))
-                    }
-                    is Segment.Const -> {
-                        emitEncryptedLdc(mv, java.lang.String.valueOf(constants[seg.index]))
-                        emitAppend(mv, "(Ljava/lang/String;)Ljava/lang/StringBuilder;")
-                    }
-                }
-
-                // 4. toString
-                mv.visitMethodInsn(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false)
-            }
-
-            private fun emitEncryptedLdc(mv: MethodVisitor, value: String) {
-                val saltBytes = XorEncryptor.encrypt(value, key)
-                val encryptedString = String(saltBytes, Charsets.ISO_8859_1)
-                if (modifiedUtf8Length(encryptedString) > 65535) {
-                    mv.visitLdcInsn(value)
-                    return
-                }
-                mv.visitLdcInsn(encryptedString)
-                mv.visitMethodInsn(
+            out.add(LdcInsnNode(encryptedString))
+            out.add(
+                MethodInsnNode(
                     INVOKESTATIC,
                     decryptorClass,
                     decryptorMethod,
                     "(Ljava/lang/String;)Ljava/lang/String;",
                     false
                 )
+            )
+        }
+
+        /** Modified-UTF-8 byte count for an ISO-8859-1 [s] without encoding it. */
+        private fun modifiedUtf8Length(s: String): Int {
+            var len = 0
+            for (c in s) {
+                len += when {
+                    c.code in 0x0001..0x007F -> 1
+                    c.code == 0x0000 || c.code in 0x0080..0x07FF -> 2
+                    else -> 3
+                }
             }
+            return len
+        }
+
+        /**
+         * Rewrites one `StringConcatFactory` [indy] into a stack-neutral `StringBuilder` block.
+         * Returns null (fail-open) when the recipe is malformed — the caller keeps the original
+         * invokedynamic. Arg values are saved to fresh locals starting at [baseLocal]; the caller
+         * advances the free-local cursor by the args' total slot size.
+         */
+        private fun rewriteIndy(
+            indy: InvokeDynamicInsnNode, baseLocal: Int, key: Long,
+            decryptorClass: String, decryptorMethod: String
+        ): InsnList? {
+            val argTypes = Type.getArgumentTypes(indy.desc)
+            val recipe = when (indy.bsm.name) {
+                "makeConcat" -> "\u0001".repeat(argTypes.size)
+                else -> indy.bsmArgs.getOrNull(0) as? String ?: return null
+            }
+            val constants = indy.bsmArgs.drop(1)
+            val segments = parseRecipe(recipe, argTypes.size, constants.size) ?: return null
+
+            val slots = IntArray(argTypes.size)
+            var cursor = baseLocal
+            for (i in argTypes.indices) {
+                slots[i] = cursor
+                cursor += argTypes[i].size
+            }
+
+            val out = InsnList()
+
+            // 1. Save args: descriptor order argTypes[0..n-1]; on stack argTypes[n-1] deepest.
+            for (i in argTypes.indices.reversed()) {
+                out.add(VarInsnNode(argTypes[i].getOpcode(Opcodes.ISTORE), slots[i]))
+            }
+
+            // 2. StringBuilder
+            out.add(TypeInsnNode(Opcodes.NEW, "java/lang/StringBuilder"))
+            out.add(InsnNode(Opcodes.DUP))
+            out.add(MethodInsnNode(Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false))
+
+            // 3. Segments
+            for (seg in segments) when (seg) {
+                is Segment.Literal -> {
+                    emitEncryptedLdc(out, seg.text, key, decryptorClass, decryptorMethod)
+                    emitAppend(out, "(Ljava/lang/String;)Ljava/lang/StringBuilder;")
+                }
+                is Segment.Arg -> {
+                    out.add(VarInsnNode(argTypes[seg.index].getOpcode(Opcodes.ILOAD), slots[seg.index]))
+                    emitAppend(out, appendDescriptorFor(argTypes[seg.index]))
+                }
+                is Segment.Const -> {
+                    emitEncryptedLdc(out, java.lang.String.valueOf(constants[seg.index]), key, decryptorClass, decryptorMethod)
+                    emitAppend(out, "(Ljava/lang/String;)Ljava/lang/StringBuilder;")
+                }
+            }
+
+            // 4. toString
+            out.add(MethodInsnNode(Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false))
+            return out
         }
 
         // -----------------------------------------------------------------------
@@ -377,9 +423,11 @@ abstract class EncryptClassesTask : DefaultTask() {
             else -> "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
         }
 
-        private fun emitAppend(mv: MethodVisitor, argDesc: String) {
-            mv.visitMethodInsn(
-                INVOKEVIRTUAL, "java/lang/StringBuilder", "append", argDesc, false
+        private fun emitAppend(out: InsnList, argDesc: String) {
+            out.add(
+                MethodInsnNode(
+                    INVOKEVIRTUAL, "java/lang/StringBuilder", "append", argDesc, false
+                )
             )
         }
     }

@@ -28,6 +28,7 @@ kotlin {
 dependencies {
     implementation("org.ow2.asm:asm:9.7")
     implementation("org.ow2.asm:asm-commons:9.7")
+    implementation("org.ow2.asm:asm-tree:9.7")
     compileOnly(gradleApi())
     compileOnly("com.android.tools.build:gradle:8.3.0")
     compileOnly("org.jetbrains.kotlin:kotlin-gradle-plugin:2.4.0")
