@@ -286,7 +286,7 @@ abstract class EncryptClassesTask : DefaultTask() {
                 for (seg in segments) when (seg) {
                     is Segment.Literal -> {
                         emitEncryptedLdc(mv, seg.text)
-                        emitAppend(mv, "Ljava/lang/String;")
+                        emitAppend(mv, "(Ljava/lang/String;)Ljava/lang/StringBuilder;")
                     }
                     is Segment.Arg -> {
                         mv.visitVarInsn(argTypes[seg.index].getOpcode(Opcodes.ILOAD), slots[seg.index])
@@ -294,7 +294,7 @@ abstract class EncryptClassesTask : DefaultTask() {
                     }
                     is Segment.Const -> {
                         emitEncryptedLdc(mv, java.lang.String.valueOf(constants[seg.index]))
-                        emitAppend(mv, "Ljava/lang/String;")
+                        emitAppend(mv, "(Ljava/lang/String;)Ljava/lang/StringBuilder;")
                     }
                 }
 
