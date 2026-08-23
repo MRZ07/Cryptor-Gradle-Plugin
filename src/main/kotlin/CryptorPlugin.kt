@@ -421,12 +421,26 @@ class CryptorPlugin : Plugin<Project> {
                     jar.dependsOn(assetsTask)
                     jar.from(assetsTask.flatMap { it.outputDir })
                     // Exclude the raw asset files processResources copied to build/resources/main/
-                    // so only encrypted versions from build/encryptedAssets/ land in the JAR
+                    // so only encrypted versions from build/encryptedAssets/ land in the JAR.
+                    //
+                    // Only exclude a raw file when an encrypted counterpart was actually
+                    // produced for its relative path. Module-level resources that live
+                    // outside assetsDir (e.g. lwjgl3 window icons) match the extension
+                    // filter but have no counterpart — excluding them unconditionally
+                    // removed them from every release JAR and crashed the game on
+                    // Windows at boot (GdxRuntimeException: Couldn't load file:
+                    // libgdx128.png). macOS never noticed because libGDX skips icon
+                    // loading on MacOsX.
                     jar.exclude { fileDetails ->
-                        fileDetails.file.extension in encExtensions &&
-                            fileDetails.file.canonicalPath.startsWith(
-                                resourcesMain.canonicalPath + java.io.File.separator
-                            )
+                        if (fileDetails.file.extension.lowercase() !in encExtensions) return@exclude false
+                        val resMainPath = resourcesMain.canonicalPath + java.io.File.separator
+                        if (!fileDetails.file.canonicalPath.startsWith(resMainPath)) return@exclude false
+                        val relative = fileDetails.file.relativeTo(resourcesMain)
+                            .path.replace(java.io.File.separatorChar, '/')
+                        val encryptedCounterpart = java.io.File(
+                            assetsTask.flatMap { it.outputDir }.get().asFile, relative
+                        )
+                        encryptedCounterpart.isFile
                     }
                 }
             }
