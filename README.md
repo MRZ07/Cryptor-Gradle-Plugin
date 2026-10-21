@@ -385,7 +385,9 @@ tmx  png  jpg  jpeg  atlas  pack  fnt  ttf  mp3  ogg  wav  map
 | `v1.7.6` | stable | Improved Android asset encryption ordering |
 | `v1.7.8` | stable | Remove `json`/`properties` from default extensions; add `map` |
 | `v1.8.0` | stable | **AES-128-CTR** replaces XOR for assets; per-file derived keys; random IV per file; split master key (`KEY_0..KEY_3`) |
-| `v1.9.0` | ✅ **latest** | Wrapper class name obfuscation; per-string salt; arithmetic key veil; per-project derived magic header |
+| `v1.9.0` | stable | Wrapper class name obfuscation; per-string salt; arithmetic key veil; per-project derived magic header |
+| `v1.9.23` | stable | JVM asset filter matches extensions case-insensitively; encrypted output dir resolved through the task provider |
+| `v1.9.24` | ✅ **latest** | Android: `compress<Variant>Assets` is always re-run and never build-cached, so a changed `assetExtensions` cannot ship plaintext; encryption now fails the build if any configured asset is left unencrypted |
 
 ---
 
@@ -422,6 +424,22 @@ assets/  (raw)
     ▼
 build/encryptedAssets/  → wired into jar task; raw copies excluded
 ```
+
+### Android asset pipeline (in-place, and what it costs)
+
+On Android the plugin cannot intercept the packaged assets through a public AGP API, so
+`cryptorEncryptAssets<Variant>` rewrites `intermediates/assets/<variant>/merge<Variant>Assets`
+in place, runs as a finalizer of `merge<Variant>Assets`, and every consumer
+(`package<Variant>`, `package<Variant>Bundle`, `bundle<Variant>Aar`) depends on it.
+
+The price of the in-place rewrite is that Gradle's recorded state for that directory describes
+the bytes as they were *before* encryption, so a downstream task can judge itself up to date
+against stale content. That actually happened: after adding two extensions to `assetExtensions`,
+the merged directory was encrypted while the APK still shipped those two extensions as
+plaintext. Since v1.9.24 the plugin therefore marks `compress<Variant>Assets` — the one task that
+snapshots this directory and feeds both the APK and the AAB — as always-run and never
+build-cached, and the encryption step fails the build if any file with a configured extension
+is still unencrypted afterwards.
 
 ### CryptorFilesWrapper activation
 
