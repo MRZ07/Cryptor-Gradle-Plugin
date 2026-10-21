@@ -1,4 +1,5 @@
 import com.android.build.api.variant.AndroidComponentsExtension
+import org.gradle.api.GradleException
 import org.gradle.api.Plugin
 import org.gradle.api.Project
 import org.gradle.api.Task
@@ -238,12 +239,32 @@ class CryptorPlugin : Plugin<Project> {
                         if (!dir.exists()) return@doLast
                         val masterKey = AesFileEncryptor.deriveAesKey(extension.key.get())
                         val exts = extension.assetExtensions.get().map { it.lowercase() }.toSet()
-                        dir.walkTopDown().filter { it.isFile }.forEach { src ->
-                            if (src.extension.lowercase() !in exts) return@forEach
+                        val configured = dir.walkTopDown()
+                            .filter { it.isFile && it.extension.lowercase() in exts }
+                            .toList()
+                        configured.forEach { src ->
                             val raw = src.readBytes()
                             if (AesFileEncryptor.hasMagic(raw, masterKey)) return@forEach
                             val relPath = src.relativeTo(dir).path.replace(java.io.File.separatorChar, '/')
                             src.writeBytes(AesFileEncryptor.encrypt(raw, masterKey, relPath))
+                        }
+
+                        // Post-condition: every file whose extension is configured must carry the
+                        // project magic now. A file that slips through ships as plaintext, and
+                        // nothing downstream would notice, so fail the build and name the files.
+                        // Only the 20-byte header is re-read.
+                        val plaintext = configured.filterNot { src ->
+                            src.inputStream().use { it.readNBytes(AesFileEncryptor.HEADER_SIZE) }
+                                .let { AesFileEncryptor.hasMagic(it, masterKey) }
+                        }
+                        if (plaintext.isNotEmpty()) {
+                            val sample = plaintext.take(5)
+                                .joinToString(", ") { it.relativeTo(dir).path }
+                            throw GradleException(
+                                "[Cryptor] ${plaintext.size} asset(s) still unencrypted after " +
+                                    "cryptorEncryptAssets$variantName: $sample" +
+                                    if (plaintext.size > 5) " …" else ""
+                            )
                         }
                     }
                 }
@@ -255,16 +276,30 @@ class CryptorPlugin : Plugin<Project> {
                 listOf(
                     "package$variantName",
                     "bundle${variantName}Aar",
-                    "bundle${variantName}",
-                    // compressReleaseAssets runs between mergeReleaseAssets and packageRelease.
-                    // It reads from the mergeReleaseAssets output directory, so it must depend on
-                    // our encrypt task (which also writes to that directory) to ensure assets are
-                    // encrypted before compressReleaseAssets copies them to its own output dir.
-                    "compress${variantName}Assets"
+                    "bundle${variantName}"
                 ).forEach { tName ->
                     project.tasks.matching { it.name == tName }
                         .configureEach { it.dependsOn(encryptAssetsTask) }
                 }
+
+                // compressXxxAssets snapshots the merged asset directory and writes
+                // intermediates/compressed_assets/<variant>/compressXxxAssets. Our encryption
+                // rewrites that directory in place AFTER mergeXxxAssets declared it as an output,
+                // so Gradle's recorded state describes the pre-encryption bytes. The task can then
+                // judge itself up to date — or restore a build-cache entry — and publish jars made
+                // from plaintext. Observed in practice: assetExtensions gained two entries, the
+                // merged directory was encrypted, and the APK still shipped those two extensions
+                // as plaintext while the previously-configured ones stayed encrypted.
+                // Both artefacts consume this task's output — the APK through packageXxx and the
+                // AAB through packageXxxBundle — so forcing it here covers both.
+                project.tasks.matching { it.name == "compress${variantName}Assets" }
+                    .configureEach {
+                        it.dependsOn(encryptAssetsTask)
+                        it.outputs.upToDateWhen { false }
+                        it.outputs.doNotCacheIf(
+                            "Cryptor mutates the merged assets in place for $variantName"
+                        ) { true }
+                    }
             }
         }
     }
