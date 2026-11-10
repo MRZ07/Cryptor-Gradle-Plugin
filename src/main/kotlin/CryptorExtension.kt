@@ -47,7 +47,7 @@ abstract class CryptorExtension {
 
     init {
         enabled.convention(true)
-        key.convention(0xDEADBEEFCAFEBABEUL.toLong())
+        key.convention(CryptorPlugin.DEFAULT_KEY)
         excludePackages.convention(emptyList())
         skipDebug.convention(true)
         encryptStrings.convention(true)

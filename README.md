@@ -367,6 +367,21 @@ tmx  png  jpg  jpeg  atlas  pack  fnt  ttf  mp3  ogg  wav  map
 
 ---
 
+## Key check
+
+The plugin's default key is a public constant, so an artefact built with it is decryptable by anyone who reads this plugin. Every module that applies the plugin gets a `cryptorKeyCheck` task that fails when the key is still the default. It is deliberately not wired to any task: only the consumer knows which tasks produce a release artefact. Gate your release verification on it:
+
+```groovy
+// build.gradle
+tasks.named('verifyRelease') {
+  dependsOn ':core:cryptorKeyCheck', ':android:cryptorKeyCheck'
+}
+```
+
+The task is a no-op when `enabled = false`. A local build that needs the default key can pass `cryptorKeyCheck { enabled = false }` or skip the task.
+
+---
+
 ## Available versions
 
 > **[https://jitpack.io/#MRZ07/Cryptor-Gradle-Plugin](https://jitpack.io/#MRZ07/Cryptor-Gradle-Plugin)**
@@ -387,7 +402,8 @@ tmx  png  jpg  jpeg  atlas  pack  fnt  ttf  mp3  ogg  wav  map
 | `v1.8.0` | stable | **AES-128-CTR** replaces XOR for assets; per-file derived keys; random IV per file; split master key (`KEY_0..KEY_3`) |
 | `v1.9.0` | stable | Wrapper class name obfuscation; per-string salt; arithmetic key veil; per-project derived magic header |
 | `v1.9.23` | stable | JVM asset filter matches extensions case-insensitively; encrypted output dir resolved through the task provider |
-| `v1.9.24` | ✅ **latest** | Android: `compress<Variant>Assets` is always re-run and never build-cached, so a changed `assetExtensions` cannot ship plaintext; encryption now fails the build if any configured asset is left unencrypted |
+| `v1.9.24` | stable | Android: `compress<Variant>Assets` is always re-run and never build-cached, so a changed `assetExtensions` cannot ship plaintext; encryption now fails the build if any configured asset is left unencrypted |
+| `v1.9.25` | ✅ **latest** | Adds `cryptorKeyCheck` — fails when the key is still the public default; `DEFAULT_KEY` is exposed as a constant |
 
 ---
 

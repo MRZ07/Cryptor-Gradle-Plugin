@@ -22,6 +22,13 @@ class CryptorPlugin : Plugin<Project> {
     companion object {
         private val NAME_CHARS = "abcdefghijklmnopqrstuvwxyz"
 
+        /**
+         * The plugin's documented default key. It is public: every build that ships it
+         * produces artefacts that anyone can decrypt with this constant. It is kept as the
+         * default so a fresh clone builds without a key, but [cryptorKeyCheck] fails on it.
+         */
+        const val DEFAULT_KEY: Long = -0x2152411035014542L
+
         /** Derive a 6-letter class name from the lower 48 bits of the key. */
         fun deriveClassName(key: Long): String = buildString(6) {
             var k = key
@@ -71,6 +78,26 @@ class CryptorPlugin : Plugin<Project> {
         // Android modules: wire via AGP variant callback (must happen before afterEvaluate)
         project.plugins.withId("com.android.application") { applyAndroid(project, extension) }
         project.plugins.withId("com.android.library")     { applyAndroid(project, extension) }
+
+        // A key check every consumer can gate its release verification on. The default key
+        // is public, so a shipped artefact built with it is decryptable by anyone who reads
+        // this plugin. The task is deliberately not wired to anything: only the consumer
+        // knows which tasks are release artefacts, and failing every build would be hostile.
+        project.tasks.register("cryptorKeyCheck") { task ->
+            task.group = "cryptor"
+            task.description = "Fails when the cryptor key is still the plugin's public default"
+            task.doLast {
+                if (!extension.enabled.get()) return@doLast
+                if (extension.key.get() == DEFAULT_KEY) {
+                    throw GradleException(
+                        "Cryptor key is the plugin's public default 0xDEADBEEFCAFEBABE. " +
+                            "Every asset and string encrypted with it is decryptable by anyone " +
+                            "who reads this plugin. Set `cryptor { key = ... }` with a " +
+                            "project-specific key before building a release artefact."
+                    )
+                }
+            }
+        }
 
         // JVM / Desktop modules: wire after ALL projects are evaluated so that
         // subproject plugin checks (hasPlugin) see the fully-resolved state.
