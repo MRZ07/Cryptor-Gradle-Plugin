@@ -346,7 +346,7 @@ The plugin hooks into `AndroidComponentsExtension.onVariants` and runs an `encry
 
 The opt-in smoke runner builds and installs all six MRZ07 game apps on iOS 27.2, verifies the simulator binaries target the requested SDK, and checks encrypted bundle bytes plus freshly written decrypted sound caches; it checks music caches where the app starts music automatically. The plugin unit test exercises both sound and music delegates. SamsWorld2 boots directly into level 1 and must log the TMX load.
 
-Requirements: macOS, Xcode with the matching iOS Simulator runtime, JDK 21, and `simctl`. The runner does not download runtimes, erase simulator data, uninstall apps, or require the Simulator GUI app. It writes logs and screenshots to a temporary directory. Because v1.9.26 is not yet published, it uses the local plugin checkout as a Gradle composite build.
+Requirements: macOS, Xcode with the matching iOS Simulator runtime, JDK 21, and `simctl`. The runner does not download runtimes, erase simulator data, uninstall apps, or require the Simulator GUI app. It writes logs and screenshots to a temporary directory. It includes the local plugin checkout as a Gradle composite build so the smoke suite tests the checked-out plugin source.
 
 ```bash
 SIMULATOR_UDID=<ios-27.2-iphone-udid> tools/ios-simulator-smoke.sh
