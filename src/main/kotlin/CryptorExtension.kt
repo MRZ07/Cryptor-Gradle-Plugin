@@ -35,6 +35,13 @@ abstract class CryptorExtension {
      */
     abstract val encryptAssets: Property<Boolean>
 
+    /**
+     * When true, injects the runtime Files/Audio wrappers into this module's classes.
+     * Defaults to [encryptAssets] to preserve the existing behavior, where enabling
+     * asset encryption also requested wrapper injection.
+     */
+    abstract val injectFilesWrapper: Property<Boolean>
+
     /** Directory containing the game assets. Defaults to a folder named "assets" next to the project root. */
     abstract val assetsDir: DirectoryProperty
 
@@ -52,6 +59,7 @@ abstract class CryptorExtension {
         skipDebug.convention(true)
         encryptStrings.convention(true)
         encryptAssets.convention(true)
+        injectFilesWrapper.convention(encryptAssets)
         assetExtensions.convention(listOf(
             "tmx", "png", "jpg", "jpeg",
             "atlas", "pack", "fnt", "ttf",

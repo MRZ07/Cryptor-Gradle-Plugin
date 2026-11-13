@@ -626,8 +626,9 @@ abstract class EncryptClassesTask : DefaultTask() {
             ?.readBytes() ?: error("CryptorFilesWrapper.class not found in plugin JAR")
 
         val patched = patchCryptorFilesWrapperKeys(mainBytes, key)
+        val renamed = renameClass(patched, "CryptorFilesWrapper", filesName)
         File(outputDir, "$filesName.class").writeBytes(
-            renameClass(patched, "CryptorFilesWrapper", filesName))
+            renameClass(renamed, "CryptorAudioWrapper", audioName))
 
         listOf("CryptorFilesWrapper\$Companion", "CryptorFilesWrapper\$CryptorFileHandle")
             .forEach { innerName ->
@@ -635,7 +636,11 @@ abstract class EncryptClassesTask : DefaultTask() {
                 if (inner != null) {
                     val newName = innerName.replace("CryptorFilesWrapper", filesName)
                     File(outputDir, "$newName.class").writeBytes(
-                        renameClass(inner, "CryptorFilesWrapper", filesName))
+                        renameClass(
+                            renameClass(inner, "CryptorFilesWrapper", filesName),
+                            "CryptorAudioWrapper",
+                            audioName
+                        ))
                 }
             }
 
