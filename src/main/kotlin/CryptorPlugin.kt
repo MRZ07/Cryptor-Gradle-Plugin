@@ -343,7 +343,7 @@ class CryptorPlugin : Plugin<Project> {
     }
 
     // -------------------------------------------------------------------------
-    // JVM / Desktop wiring
+    // JVM / Desktop / RoboVM wiring
     // -------------------------------------------------------------------------
     private fun wireJvm(project: Project, extension: CryptorExtension) {
         val kotlinTask = project.tasks.findByName("compileKotlin")
@@ -416,7 +416,7 @@ class CryptorPlugin : Plugin<Project> {
             task.decryptorClassName.set(extension.key.map  { k -> deriveClassName(k)  })
             task.decryptorMethodName.set(extension.key.map { k -> deriveMethodName(k) })
             task.encryptStrings.set(extension.encryptStrings)
-            task.injectFilesWrapper.set(extension.encryptAssets)
+            task.injectFilesWrapper.set(extension.injectFilesWrapper)
             task.runtimeDecryptorHash.set(runtimeDecryptorHash())
             task.inputDirs.from(*compileDirs.toTypedArray())
             task.outputDir.set(project.layout.buildDirectory.dir("encryptedClasses"))
@@ -465,6 +465,8 @@ class CryptorPlugin : Plugin<Project> {
             }
         }
 
+        wireRobovmAssets(project, extension, encryptAssetsTask)
+
         project.plugins.withId("java") {
             project.tasks.named("jar", org.gradle.api.tasks.bundling.Jar::class.java) { jar ->
                 jar.dependsOn(encryptTask)
@@ -507,6 +509,130 @@ class CryptorPlugin : Plugin<Project> {
                 }
             }
         }
+    }
+
+    /**
+     * RoboVM reads asset directories from robovm.xml when it creates the app bundle,
+     * unlike Android's merged-assets pipeline or the JVM jar path. Point that resource
+     * entry at the generated encrypted tree and make every packaging/launch entry point
+     * depend on the task that creates it.
+     */
+    private fun wireRobovmAssets(
+        project: Project,
+        extension: CryptorExtension,
+        encryptAssetsTask: org.gradle.api.tasks.TaskProvider<EncryptAssetsTask>?
+    ) {
+        if (!project.plugins.hasPlugin("robovm")) return
+
+        val sourceAssets = extension.assetsDir.orNull?.asFile
+        val encryptAssets = extension.encryptAssets.get()
+        if (encryptAssets && sourceAssets == null) {
+            throw GradleException(
+                "[Cryptor] iOS asset encryption is enabled in ${project.path}, but assetsDir is not set. " +
+                    "Set cryptor.assetsDir to the source assets directory or disable encryptAssets."
+            )
+        }
+        if (encryptAssets && sourceAssets != null && !sourceAssets.isDirectory) {
+            throw GradleException(
+                "[Cryptor] iOS assetsDir does not exist in ${project.path}: ${sourceAssets.absolutePath}"
+            )
+        }
+
+        val assetsForBundle: File
+        val dependencies = mutableListOf<Task>()
+        if (encryptAssets) {
+            val sourceDirectory = sourceAssets!!
+            val task = encryptAssetsTask ?: throw GradleException(
+                "[Cryptor] Could not register iOS asset encryption for ${project.path}; " +
+                    "the project must apply the Java plugin with a main source set."
+            )
+            assetsForBundle = task.flatMap { it.outputDir }.get().asFile
+
+            // Some games generate assets into assetsDir (for example a texture-atlas task).
+            // Declare those producer tasks explicitly; otherwise Gradle 9 rejects the asset
+            // encryption task for reading a directory that another task writes.
+            val encryptionTask = task.get()
+            val assetProducers = project.rootProject.allprojects
+                .flatMap { candidateProject -> candidateProject.tasks.toList() }
+                .filter { candidate ->
+                    candidate != encryptionTask && candidate.outputs.files.files.any { output ->
+                        isWithinDirectory(output, sourceDirectory)
+                    }
+                }
+            task.configure { it.dependsOn(assetProducers) }
+            dependencies.add(task.get())
+        } else {
+            assetsForBundle = sourceAssets ?: project.file("../assets")
+        }
+
+        val sourceConfig = roboVmConfigFile(project)
+        val marker = "\${cryptorAssetsDirectory}"
+        if (!sourceConfig.isFile) {
+            throw GradleException("[Cryptor] RoboVM config does not exist: ${sourceConfig.absolutePath}")
+        }
+        if (!sourceConfig.readText(Charsets.UTF_8).contains(marker)) {
+            if (encryptAssets) {
+                throw GradleException(
+                    "[Cryptor] iOS asset encryption requires $marker in the RoboVM asset resource " +
+                        "directory: ${sourceConfig.absolutePath}"
+                )
+            }
+            return
+        }
+
+        val generatedConfig = project.layout.buildDirectory
+            .file("cryptor/robovm.xml").get().asFile
+        val configTask = project.tasks.register(
+            "cryptorPrepareRoboVMConfig",
+            PrepareRoboVMConfigTask::class.java
+        ) { task ->
+            task.sourceConfigFile.set(sourceConfig)
+            task.projectDirectory.set(project.projectDir.absolutePath)
+            task.assetsDirectory.set(assetsForBundle.absolutePath)
+            task.outputConfigFile.set(generatedConfig)
+            if (dependencies.isNotEmpty()) task.dependsOn(dependencies)
+        }
+        project.extensions.extraProperties.set("cryptorAssetsDirectory", assetsForBundle.absolutePath)
+        setRoboVmConfigFile(project, generatedConfig)
+
+        val resourceConsumers = setOf(
+            "build",
+            "createIPA",
+            "robovmArchive",
+            "robovmInstall",
+            "launchIPhoneSimulator",
+            "launchIPadSimulator",
+            "launchIOSDevice"
+        )
+        project.tasks.configureEach { candidate ->
+            if (candidate.name in resourceConsumers) candidate.dependsOn(configTask)
+        }
+    }
+
+    private fun roboVmConfigFile(project: Project): File {
+        val extension = project.extensions.findByName("robovm")
+            ?: throw GradleException("[Cryptor] RoboVM extension is missing in ${project.path}")
+        val getter = extension.javaClass.methods.firstOrNull {
+            it.name == "getConfigFile" && it.parameterTypes.isEmpty()
+        } ?: throw GradleException("[Cryptor] RoboVM extension does not expose configFile in ${project.path}")
+        val configured = getter.invoke(extension) as? String
+        return if (configured.isNullOrBlank()) project.file("robovm.xml") else project.file(configured)
+    }
+
+    private fun setRoboVmConfigFile(project: Project, configFile: File) {
+        val extension = project.extensions.findByName("robovm")
+            ?: throw GradleException("[Cryptor] RoboVM extension is missing in ${project.path}")
+        val setter = extension.javaClass.methods.firstOrNull {
+            it.name == "setConfigFile" && it.parameterTypes.size == 1 &&
+                it.parameterTypes[0] == String::class.java
+        } ?: throw GradleException("[Cryptor] RoboVM extension does not support configFile in ${project.path}")
+        setter.invoke(extension, configFile.absolutePath)
+    }
+
+    private fun isWithinDirectory(candidate: File, directory: File): Boolean {
+        val root = directory.canonicalPath
+        val path = candidate.canonicalPath
+        return path == root || path.startsWith(root + File.separator)
     }
 
     /**

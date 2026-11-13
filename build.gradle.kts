@@ -5,7 +5,7 @@ plugins {
 }
 
 group   = "com.github.MRZ07"
-version = "v1.9.25"
+version = "v1.9.26"
 
 repositories {
     mavenCentral()
@@ -35,6 +35,7 @@ dependencies {
     compileOnly("com.badlogicgames.gdx:gdx:1.14.0")
 
     testImplementation(kotlin("test"))
+    testImplementation(gradleApi())
     testImplementation("com.badlogicgames.gdx:gdx:1.14.0")
 }
 

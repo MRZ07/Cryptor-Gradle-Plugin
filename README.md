@@ -5,7 +5,7 @@
 A Gradle plugin that **encrypts all string literals and game assets at build time** using ASM bytecode transformation.
 Strings and assets are decrypted transparently at runtime — fully offline, with zero source-code changes required.
 
-Works with **any JVM Gradle project** (Kotlin, Java, multi-module) and has first-class support for **LibGDX** (Android + Desktop/lwjgl3).
+Works with **any JVM Gradle project** (Kotlin, Java, multi-module) and has first-class support for **LibGDX** (Android, Desktop/lwjgl3, and iOS/RoboVM from v1.9.26).
 
 ---
 
@@ -339,8 +339,8 @@ cryptor {
 
 The plugin hooks into `AndroidComponentsExtension.onVariants` and runs an `encryptStrings<Variant>` task for each build variant automatically.
 
-> **iOS (RoboVM):** Asset encryption is **not supported** on iOS — RoboVM does not expose Gradle task hooks that allow intercepting the IPA asset packaging pipeline.
-> **String encryption is fully active on iOS** because the encrypted `.class` files come from `core`, which is compiled on the JVM path and included in the RoboVM build via project dependency.
+> **iOS (RoboVM):** v1.9.26 supports asset encryption by generating an encrypted asset tree before RoboVM packages the app. Put `${cryptorAssetsDirectory}` in the app-assets `<directory>` in `ios/robovm.xml` and configure `cryptor { assetsDir = file('../assets'); encryptAssets = true }` in the iOS module. The plugin writes a build-local RoboVM config with that marker replaced by the encrypted output path and rebases other relative resource/framework/plist paths, then wires preparation before RoboVM build, archive, install, and launch tasks. The source config and assets are never modified.
+> **Runtime:** Keep the keyed `CryptorFilesWrapper` injected by `core` (set `injectFilesWrapper = false` and `encryptStrings = false` in the iOS module to avoid duplicate runtime classes). It decrypts internal reads and materializes decrypted files under LibGDX's writable local directory when a native loader needs a real path; audio uses the same local cache. Assets are plaintext while in memory or in this app-private cache, so this is encryption at rest, not secrecy from a determined client reverse engineer.
 
 ---
 
@@ -355,7 +355,8 @@ All options go inside the `cryptor { }` block:
 | `excludePackages` | `List<String>` | `[]` | Additional slash-separated package prefixes to skip (e.g. `['com/google/']`). Kotlin, JDK, and Android are always excluded. |
 | `skipDebug` | `Boolean` | `true` | When `true`, debug build variants are not encrypted so stack traces remain readable during development. |
 | `encryptStrings` | `Boolean` | `true` | When `true`, string literals in class files are encrypted with a per-string derived key. |
-| `encryptAssets` | `Boolean` | `true` | When `true`, asset files in `assetsDir` are AES-128-CTR encrypted and the files wrapper is injected. Requires `assetsDir`. |
+| `encryptAssets` | `Boolean` | `true` | When `true`, asset files in `assetsDir` are AES-128-CTR encrypted. Requires `assetsDir`. |
+| `injectFilesWrapper` | `Boolean` | follows `encryptAssets` | When `true`, injects the runtime `Files`/`Audio` wrappers into this module. Set to `false` in platform modules when `core` already owns the wrappers. |
 | `assetsDir` | `DirectoryProperty` | _(unset)_ | Path to the assets directory to encrypt. Must be set when `encryptAssets = true`. |
 | `assetExtensions` | `List<String>` | see below | File extensions to encrypt. |
 
@@ -404,6 +405,7 @@ The task is a no-op when `enabled = false`. A local build that needs the default
 | `v1.9.23` | stable | JVM asset filter matches extensions case-insensitively; encrypted output dir resolved through the task provider |
 | `v1.9.24` | stable | Android: `compress<Variant>Assets` is always re-run and never build-cached, so a changed `assetExtensions` cannot ship plaintext; encryption now fails the build if any configured asset is left unencrypted |
 | `v1.9.25` | ✅ **latest** | Adds `cryptorKeyCheck` — fails when the key is still the public default; `DEFAULT_KEY` is exposed as a constant |
+| `v1.9.26` | in development | RoboVM/iOS: package a generated encrypted resource tree and decrypt real-file/audio reads through LibGDX's writable local directory |
 
 ---
 
@@ -414,12 +416,12 @@ The task is a no-op when `enabled = false`. A local build that needs the default
 ```
 src/main/kotlin/
 ├── CryptorPlugin.kt         # entry point — wires tasks, derives all obfuscated names from key
-├── CryptorExtension.kt      # DSL: enabled, key, excludePackages, skipDebug, encryptStrings, encryptAssets, assetsDir, assetExtensions
+├── CryptorExtension.kt      # DSL: enabled, key, excludePackages, skipDebug, encryptStrings, encryptAssets, injectFilesWrapper, assetsDir, assetExtensions
 ├── EncryptClassesTask.kt    # ASM transformation + decryptor/wrapper injection + create()/resume() patch
 ├── EncryptAssetsTask.kt     # AES-128-CTR encrypts asset files with per-file derived keys
 ├── AesFileEncryptor.kt      # AES crypto: key derivation, per-file key, encrypt, decrypt, per-project magic
 ├── CryptorFilesWrapper.kt   # Runtime Files proxy — injected and renamed; decrypts on read
-├── CryptorAudioWrapper.kt   # Runtime Audio proxy — decrypts audio to temp file; ProGuard/R8 safe
+├── CryptorAudioWrapper.kt   # Runtime Audio proxy — decrypts audio to LibGDX local cache; ProGuard/R8 safe
 ├── XorEncryptor.kt          # String encrypt: salt = murmur64(plaintext), derivedKey = key XOR salt
 └── StringDecryptor.kt       # Decryptor template — injected, renamed, and key-patched at build time
 ```

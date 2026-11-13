@@ -1,4 +1,5 @@
 import com.badlogic.gdx.Files
+import com.badlogic.gdx.Gdx
 import com.badlogic.gdx.files.FileHandle
 import java.io.ByteArrayInputStream
 import java.io.InputStream
@@ -42,15 +43,29 @@ class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
 
         private fun normPath(): String = source.path().replace('\\', '/')
 
+        private val encrypted: Boolean by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            val header = ByteArray(AesFileEncryptor.HEADER_SIZE)
+            var offset = 0
+            source.read().use { input ->
+                while (offset < header.size) {
+                    val count = input.read(header, offset, header.size - offset)
+                    if (count < 0) break
+                    offset += count
+                }
+            }
+            offset == header.size && AesFileEncryptor.hasMagic(header, masterKey())
+        }
+
+        private val rawBytes: ByteArray by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+            source.readBytes()
+        }
+
         /**
          * Decrypted bytes, computed at most once per handle instance.
          * Non-encrypted files (hasMagic = false) are returned as-is.
          */
         private val decrypted: ByteArray by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-            val raw = source.readBytes()
-            val mk  = masterKey()
-            if (AesFileEncryptor.hasMagic(raw, mk)) AesFileEncryptor.decrypt(raw, mk, normPath())
-            else raw
+            if (encrypted) AesFileEncryptor.decrypt(rawBytes, masterKey(), normPath()) else rawBytes
         }
 
         override fun read(): InputStream    = ByteArrayInputStream(decrypted)
@@ -84,6 +99,12 @@ class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
             source.list().map { CryptorFileHandle(it) }.toTypedArray()
         override fun list(suffix: String): Array<FileHandle> =
             source.list(suffix).map { CryptorFileHandle(it) }.toTypedArray()
-        override fun file(): java.io.File = source.file()
+        override fun file(): java.io.File {
+            if (!CryptorAudioWrapper.usesIOSLocalCache()) return source.file()
+            if (!source.exists() || !encrypted) {
+                return source.file()
+            }
+            return CryptorAudioWrapper.materialize("assets", normPath(), decrypted).file()
+        }
     }
 }
