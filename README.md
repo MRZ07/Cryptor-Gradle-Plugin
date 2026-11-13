@@ -414,8 +414,8 @@ The task is a no-op when `enabled = false`. A local build that needs the default
 | `v1.9.0` | stable | Wrapper class name obfuscation; per-string salt; arithmetic key veil; per-project derived magic header |
 | `v1.9.23` | stable | JVM asset filter matches extensions case-insensitively; encrypted output dir resolved through the task provider |
 | `v1.9.24` | stable | Android: `compress<Variant>Assets` is always re-run and never build-cached, so a changed `assetExtensions` cannot ship plaintext; encryption now fails the build if any configured asset is left unencrypted |
-| `v1.9.25` | ✅ **latest** | Adds `cryptorKeyCheck` — fails when the key is still the public default; `DEFAULT_KEY` is exposed as a constant |
-| `v1.9.26` | in development | RoboVM/iOS: package a generated encrypted resource tree and decrypt real-file/audio reads through LibGDX's writable local directory |
+| `v1.9.25` | stable | Adds `cryptorKeyCheck` — fails when the key is still the public default; `DEFAULT_KEY` is exposed as a constant |
+| `v1.9.26` | ✅ **latest** | RoboVM/iOS: package a generated encrypted resource tree and decrypt real-file/audio reads through LibGDX's writable local directory |
 
 ---
 
