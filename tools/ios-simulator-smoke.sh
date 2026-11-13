@@ -330,7 +330,11 @@ run_app() {
     local screenshot="$LOG_DIR/$app.png"
     xcrun simctl io "$simulator_udid" screenshot "$screenshot" >/dev/null
     [[ -s "$screenshot" ]] || fail "$app screenshot was not written"
-    echo "PASS $app (iOS $IOS_VERSION, encrypted bundle, startup/TMX, sound/music cache, screenshot)"
+    local audio_assertion="sound cache"
+    if [[ "$music_relative" != "-" ]]; then
+        audio_assertion="sound/music cache"
+    fi
+    echo "PASS $app (iOS $IOS_VERSION, encrypted bundle, startup/TMX, $audio_assertion, screenshot)"
     xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
 }
 
