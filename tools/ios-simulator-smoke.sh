@@ -63,16 +63,15 @@ echo "Logs and screenshots: $LOG_DIR"
 
 verify_bundle_assets() {
     local app="$1"
-    local mode="$2"
-    local assets="$3"
-    local encrypted="$4"
-    local bundle="$5"
-    python3 - "$app" "$mode" "$assets" "$encrypted" "$bundle" <<'PY'
+    local assets="$2"
+    local encrypted="$3"
+    local bundle="$4"
+    python3 - "$app" "$assets" "$encrypted" "$bundle" <<'PY'
 from pathlib import Path
 import sys
 
-app, mode = sys.argv[1], sys.argv[2]
-assets, encrypted, bundle = map(Path, sys.argv[3:])
+app = sys.argv[1]
+assets, encrypted, bundle = map(Path, sys.argv[2:])
 encrypted_extensions = {
     ".tmx", ".png", ".jpg", ".jpeg", ".atlas", ".pack", ".fnt", ".ttf",
     ".mp3", ".ogg", ".wav", ".map",
@@ -85,9 +84,11 @@ if not fixtures:
     raise SystemExit(f"No configured Cryptor asset fixture under {assets}")
 samples = [fixtures[0]]
 if app == "SamsWorld2":
-    samples.append(assets / "map/level/1/start.tmx")
-    if mode == "encrypted":
-        samples.extend([assets / "ts/main.tsx", assets / "i18n/bundle.properties"])
+    samples.extend([
+        assets / "map/level/1/start.tmx",
+        assets / "ts/main.tsx",
+        assets / "i18n/bundle.properties",
+    ])
 
 for source in samples:
     relative = source.relative_to(assets)
@@ -97,19 +98,14 @@ for source in samples:
         raise SystemExit(f"Missing source/bundled fixture: {relative}")
     raw = source.read_bytes()
     packaged = bundled_file.read_bytes()
-    if mode == "encrypted":
-        if not encrypted_file.is_file():
-            raise SystemExit(f"Missing encrypted output: {relative}")
-        ciphertext = encrypted_file.read_bytes()
-        if raw == ciphertext:
-            raise SystemExit(f"Asset was not encrypted: {relative}")
-        if ciphertext != packaged:
-            raise SystemExit(f"Simulator app did not package encrypted bytes: {relative}")
-        print(f"encrypted bundle bytes verified: {relative}")
-    else:
-        if raw != packaged:
-            raise SystemExit(f"Startup-only app did not bundle the expected source bytes: {relative}")
-        print(f"startup-only bundle bytes verified: {relative}")
+    if not encrypted_file.is_file():
+        raise SystemExit(f"Missing encrypted output: {relative}")
+    ciphertext = encrypted_file.read_bytes()
+    if raw == ciphertext:
+        raise SystemExit(f"Asset was not encrypted: {relative}")
+    if ciphertext != packaged:
+        raise SystemExit(f"Simulator app did not package encrypted bytes: {relative}")
+    print(f"encrypted bundle bytes verified: {relative}")
 PY
 }
 
@@ -204,9 +200,8 @@ PY
 
 run_app() {
     local app="$1"
-    local mode="$2"
-    local sound_relative="$3"
-    local music_relative="$4"
+    local sound_relative="$2"
+    local music_relative="$3"
     local repo="$MRZ_ROOT/$app"
     local assets="$repo/assets"
     local properties="$repo/ios/robovm.properties"
@@ -215,11 +210,9 @@ run_app() {
 
     [[ -x "$repo/gradlew" ]] || fail "$app has no executable Gradle wrapper"
     [[ -f "$properties" ]] || fail "$app is missing ios/robovm.properties"
-    if [[ "$mode" == "encrypted" ]]; then
-        [[ -f "$assets/$sound_relative" ]] || fail "$app is missing audio fixture $sound_relative"
-        if [[ "$music_relative" != "-" ]]; then
-            [[ -f "$assets/$music_relative" ]] || fail "$app is missing music fixture $music_relative"
-        fi
+    [[ -f "$assets/$sound_relative" ]] || fail "$app is missing audio fixture $sound_relative"
+    if [[ "$music_relative" != "-" ]]; then
+        [[ -f "$assets/$music_relative" ]] || fail "$app is missing music fixture $music_relative"
     fi
 
     local identity bundle_id executable
@@ -228,11 +221,20 @@ run_app() {
     local simulator_app="$repo/ios/build/robovm.tmp/$executable.app"
 
     echo "[$app] building simulator app..."
-    if ! (cd "$repo" && ./gradlew \
-        --include-build "$PLUGIN_ROOT" \
-        -Probovm.device.name="$simulator_name" \
-        -Probovm.sdk.version="$IOS_VERSION" \
-        :ios:launchIPhoneSimulator --console=plain) >"$gradle_log" 2>&1; then
+    local build_status=0
+    if [[ "$app" == "SamsWorld2" ]]; then
+        (cd "$repo" && CRYPTOR_PLUGIN_INCLUDE_BUILD="$PLUGIN_ROOT" ./gradlew \
+            -Probovm.device.name="$simulator_name" \
+            -Probovm.sdk.version="$IOS_VERSION" \
+            :ios:launchIPhoneSimulator --console=plain) >"$gradle_log" 2>&1 || build_status=$?
+    else
+        (cd "$repo" && ./gradlew \
+            --include-build "$PLUGIN_ROOT" \
+            -Probovm.device.name="$simulator_name" \
+            -Probovm.sdk.version="$IOS_VERSION" \
+            :ios:launchIPhoneSimulator --console=plain) >"$gradle_log" 2>&1 || build_status=$?
+    fi
+    if [[ "$build_status" -ne 0 ]]; then
         tail -n 80 "$gradle_log" >&2
         fail "$app simulator build failed (see $gradle_log)"
     fi
@@ -246,7 +248,7 @@ run_app() {
     printf '%s\n' "$build_info" | grep -Fq "platform IOSSIMULATOR" || fail "$app binary is not an iOS Simulator build"
     printf '%s\n' "$build_info" | grep -Fq "sdk $IOS_VERSION" || fail "$app binary was not built with iOS $IOS_VERSION SDK"
 
-    verify_bundle_assets "$app" "$mode" "$assets" "$repo/ios/build/encryptedAssets" "$simulator_app"
+    verify_bundle_assets "$app" "$assets" "$repo/ios/build/encryptedAssets" "$simulator_app"
 
     local tmx_relative=""
     if [[ "$app" == "SamsWorld2" ]]; then
@@ -259,9 +261,7 @@ run_app() {
     local container
     container="$(xcrun simctl get_app_container "$simulator_udid" "$bundle_id" data)"
     local audio_baseline="$LOG_DIR/$app-audio-before.json"
-    if [[ "$mode" == "encrypted" ]]; then
-        snapshot_audio_cache "$container" "$sound_relative" "$music_relative" > "$audio_baseline"
-    fi
+    snapshot_audio_cache "$container" "$sound_relative" "$music_relative" > "$audio_baseline"
 
     local launch_log_start
     launch_log_start="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -287,29 +287,25 @@ run_app() {
     done
     [[ "$running" == true ]] || fail "$app process exited before smoke assertions (pid $pid)"
 
-    if [[ "$mode" == "encrypted" ]]; then
-        local audio_ok=false
-        local attempt
-        for attempt in $(seq 1 30); do
-            if verify_audio_cache "$assets" "$container" "$sound_relative" "$music_relative" "$audio_baseline" >"$LOG_DIR/$app-audio.txt" 2>&1; then
-                audio_ok=true
-                break
-            fi
-            sleep 2
-        done
-        if [[ "$audio_ok" != true ]]; then
-            cat "$LOG_DIR/$app-audio.txt" >&2
-            fail "$app did not materialize fresh decrypted sound/music assets"
+    local audio_ok=false
+    local attempt
+    for attempt in $(seq 1 30); do
+        if verify_audio_cache "$assets" "$container" "$sound_relative" "$music_relative" "$audio_baseline" >"$LOG_DIR/$app-audio.txt" 2>&1; then
+            audio_ok=true
+            break
         fi
-        cat "$LOG_DIR/$app-audio.txt"
-    else
-        echo "$app startup-only mode: no Cryptor audio-cache assertion"
+        sleep 2
+    done
+    if [[ "$audio_ok" != true ]]; then
+        cat "$LOG_DIR/$app-audio.txt" >&2
+        fail "$app did not materialize fresh decrypted sound/music assets"
     fi
+    cat "$LOG_DIR/$app-audio.txt"
 
     xcrun simctl spawn "$simulator_udid" log show --start "$launch_log_start" --style compact \
         --predicate "process == \"$executable\" AND processIdentifier == $pid" \
         >"$app_log" 2>/dev/null || true
-    if [[ "$app" == "SamsWorld2" ]]; then
+    if [[ -n "$tmx_relative" ]]; then
         local tmx_loaded=false
         for attempt in $(seq 1 30); do
             xcrun simctl spawn "$simulator_udid" log show --start "$launch_log_start" --style compact \
@@ -321,10 +317,10 @@ run_app() {
             fi
             sleep 1
         done
-        [[ "$tmx_loaded" == true ]] || fail "SamsWorld2 did not load the level-1 TMX fixture"
-        grep -Fq "LocalizationManager: locale=" "$app_log" || fail "SamsWorld2 startup localization marker is missing"
+        [[ "$tmx_loaded" == true ]] || fail "$app did not load the level-1 TMX fixture"
+        grep -Fq "LocalizationManager: locale=" "$app_log" || fail "$app startup localization marker is missing"
         if grep -Fq "LocalizationManager.loadLocaleLanguageBundle() must be called before getBundle()" "$app_log"; then
-            fail "SamsWorld2 hit the startup localization ordering regression"
+            fail "$app hit the startup localization ordering regression"
         fi
     fi
 
@@ -334,19 +330,15 @@ run_app() {
     local screenshot="$LOG_DIR/$app.png"
     xcrun simctl io "$simulator_udid" screenshot "$screenshot" >/dev/null
     [[ -s "$screenshot" ]] || fail "$app screenshot was not written"
-    if [[ "$mode" == "encrypted" ]]; then
-        echo "PASS $app (iOS $IOS_VERSION, encrypted bundle, startup, audio cache, screenshot)"
-    else
-        echo "PASS $app (iOS $IOS_VERSION, startup/TMX and screenshot; Cryptor assets/audio are not asserted)"
-    fi
+    echo "PASS $app (iOS $IOS_VERSION, encrypted bundle, startup/TMX, sound/music cache, screenshot)"
     xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
 }
 
-run_app SamsWorld2 startup-only "-" "-"
-run_app SamsWorld encrypted "sounds/kick.mp3" "music/menu.mp3"
-run_app ZacksWorld encrypted "sounds/kick.mp3" "music/menu.mp3"
-run_app SamsLevelMaker encrypted "sounds/bump.mp3" "-"
-run_app ZacksLevelMaker encrypted "sounds/bump.mp3" "-"
-run_app MakeWords encrypted "sounds/click.mp3" "music/menu.mp3"
+run_app SamsWorld2 "sounds/ui/screen/title/start.mp3" "music/level/adventure2.mp3"
+run_app SamsWorld "sounds/kick.mp3" "music/menu.mp3"
+run_app ZacksWorld "sounds/kick.mp3" "music/menu.mp3"
+run_app SamsLevelMaker "sounds/bump.mp3" "-"
+run_app ZacksLevelMaker "sounds/bump.mp3" "-"
+run_app MakeWords "sounds/click.mp3" "music/menu.mp3"
 
 echo "All Cryptor iOS simulator smoke tests passed on iOS $IOS_VERSION. Logs: $LOG_DIR"

@@ -344,7 +344,7 @@ The plugin hooks into `AndroidComponentsExtension.onVariants` and runs an `encry
 
 ## iOS Simulator smoke tests
 
-The opt-in smoke runner builds and installs the six MRZ07 game apps on iOS 27.2, verifies the simulator binaries target the requested SDK, and checks encrypted bundle bytes plus freshly written decrypted sound caches for the five apps whose current iOS configuration enables Cryptor assets. It checks music caches where those apps start music automatically; the plugin unit test exercises both sound and music delegates. SamsWorld2 currently pins the published v1.9.24 and has iOS Cryptor disabled, so it is a startup/TMX smoke only, with no Cryptor asset/audio-cache assertions; it boots directly into level 1 and must log the TMX load.
+The opt-in smoke runner builds and installs all six MRZ07 game apps on iOS 27.2, verifies the simulator binaries target the requested SDK, and checks encrypted bundle bytes plus freshly written decrypted sound caches; it checks music caches where the app starts music automatically. The plugin unit test exercises both sound and music delegates. SamsWorld2 boots directly into level 1 and must log the TMX load.
 
 Requirements: macOS, Xcode with the matching iOS Simulator runtime, JDK 21, and `simctl`. The runner does not download runtimes, erase simulator data, uninstall apps, or require the Simulator GUI app. It writes logs and screenshots to a temporary directory. Because v1.9.26 is not yet published, it uses the local plugin checkout as a Gradle composite build.
 
