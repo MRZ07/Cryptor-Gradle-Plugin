@@ -2,6 +2,7 @@ import com.badlogic.gdx.Application
 import com.badlogic.gdx.Audio
 import com.badlogic.gdx.Files
 import com.badlogic.gdx.Gdx
+import com.badlogic.gdx.audio.Music
 import com.badlogic.gdx.audio.Sound
 import com.badlogic.gdx.files.FileHandle
 import java.io.ByteArrayInputStream
@@ -24,20 +25,32 @@ class CryptorFilesWrapperTest {
         val plainBytes = byteArrayOf(11, 22, 33, 44, 55)
         val masterKey = ByteArray(16)
         val assetPath = "images/${System.nanoTime()}.png"
+        val tmxPath = "map/level/${System.nanoTime()}.tmx"
         val audioPath = "sounds/${System.nanoTime()}.mp3"
+        val musicPath = "music/${System.nanoTime()}.mp3"
         var receivedSoundFile: FileHandle? = null
+        var receivedMusicFile: FileHandle? = null
         val sound = proxy<Sound>(Sound::class.java) { _, _ -> null }
+        val music = proxy<Music>(Music::class.java) { _, _ -> null }
         val audio = proxy<Audio>(Audio::class.java) { method, args ->
-            if (method.name == "newSound") {
-                receivedSoundFile = args!![0] as FileHandle
-                sound
-            } else {
-                null
+            when (method.name) {
+                "newSound" -> {
+                    receivedSoundFile = args!![0] as FileHandle
+                    sound
+                }
+                "newMusic" -> {
+                    receivedMusicFile = args!![0] as FileHandle
+                    music
+                }
+                else -> null
             }
         }
+        val tmxBytes = "<map version=\"1.0\"/>".toByteArray(Charsets.UTF_8)
         val encryptedAssets = mapOf(
             assetPath to AesFileEncryptor.encrypt(plainBytes, masterKey, assetPath),
-            audioPath to AesFileEncryptor.encrypt(plainBytes, masterKey, audioPath)
+            tmxPath to AesFileEncryptor.encrypt(tmxBytes, masterKey, tmxPath),
+            audioPath to AesFileEncryptor.encrypt(plainBytes, masterKey, audioPath),
+            musicPath to AesFileEncryptor.encrypt(plainBytes, masterKey, musicPath)
         )
         val sourceFiles = mutableMapOf<String, MemoryInternalFileHandle>()
         val files = proxy<Files>(Files::class.java) { method, args ->
@@ -67,11 +80,18 @@ class CryptorFilesWrapperTest {
             assertTrue(decryptedFile.absolutePath.startsWith(root.absolutePath))
             assertContentEquals(plainBytes, decryptedFile.readBytes())
             assertTrue(sourceFiles.getValue(assetPath).readCount > 0)
+            assertContentEquals(tmxBytes, wrappedFiles.internal(tmxPath).readBytes())
 
-            CryptorAudioWrapper(audio).newSound(wrappedFiles.internal(audioPath))
+            val audioWrapper = CryptorAudioWrapper(audio)
+            audioWrapper.newSound(wrappedFiles.internal(audioPath))
             val audioFile = requireNotNull(receivedSoundFile).file()
             assertTrue(audioFile.absolutePath.startsWith(root.absolutePath))
             assertContentEquals(plainBytes, audioFile.readBytes())
+
+            audioWrapper.newMusic(wrappedFiles.internal(musicPath))
+            val musicFile = requireNotNull(receivedMusicFile).file()
+            assertTrue(musicFile.absolutePath.startsWith(root.absolutePath))
+            assertContentEquals(plainBytes, musicFile.readBytes())
         } finally {
             Gdx.files = previousFiles
             Gdx.app = previousApp

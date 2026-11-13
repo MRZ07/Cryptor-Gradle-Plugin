@@ -342,6 +342,16 @@ The plugin hooks into `AndroidComponentsExtension.onVariants` and runs an `encry
 > **iOS (RoboVM):** v1.9.26 supports asset encryption by generating an encrypted asset tree before RoboVM packages the app. Put `${cryptorAssetsDirectory}` in the app-assets `<directory>` in `ios/robovm.xml` and configure `cryptor { assetsDir = file('../assets'); encryptAssets = true }` in the iOS module. The plugin writes a build-local RoboVM config with that marker replaced by the encrypted output path and rebases other relative resource/framework/plist paths, then wires preparation before RoboVM build, archive, install, and launch tasks. The source config and assets are never modified.
 > **Runtime:** Keep the keyed `CryptorFilesWrapper` injected by `core` (set `injectFilesWrapper = false` and `encryptStrings = false` in the iOS module to avoid duplicate runtime classes). It decrypts internal reads and materializes decrypted files under LibGDX's writable local directory when a native loader needs a real path; audio uses the same local cache. Assets are plaintext while in memory or in this app-private cache, so this is encryption at rest, not secrecy from a determined client reverse engineer.
 
+## iOS Simulator smoke tests
+
+The opt-in smoke runner builds and installs the six MRZ07 game apps on iOS 27.2, verifies the simulator binaries target the requested SDK, and checks encrypted bundle bytes plus freshly written decrypted sound caches for the five apps whose current iOS configuration enables Cryptor assets. It checks music caches where those apps start music automatically; the plugin unit test exercises both sound and music delegates. SamsWorld2 currently pins the published v1.9.24 and has iOS Cryptor disabled, so it is a startup/TMX smoke only, with no Cryptor asset/audio-cache assertions; it boots directly into level 1 and must log the TMX load.
+
+Requirements: macOS, Xcode with the matching iOS Simulator runtime, JDK 21, and `simctl`. The runner does not download runtimes, erase simulator data, uninstall apps, or require the Simulator GUI app. It writes logs and screenshots to a temporary directory. Because v1.9.26 is not yet published, it uses the local plugin checkout as a Gradle composite build.
+
+```bash
+SIMULATOR_UDID=<ios-27.2-iphone-udid> tools/ios-simulator-smoke.sh
+```
+
 ---
 
 ## Configuration Reference
@@ -417,6 +427,7 @@ The task is a no-op when `enabled = false`. A local build that needs the default
 src/main/kotlin/
 ├── CryptorPlugin.kt         # entry point — wires tasks, derives all obfuscated names from key
 ├── CryptorExtension.kt      # DSL: enabled, key, excludePackages, skipDebug, encryptStrings, encryptAssets, injectFilesWrapper, assetsDir, assetExtensions
+├── PrepareRoboVMConfigTask.kt # Resolves encrypted asset paths in a build-local RoboVM config
 ├── EncryptClassesTask.kt    # ASM transformation + decryptor/wrapper injection + create()/resume() patch
 ├── EncryptAssetsTask.kt     # AES-128-CTR encrypts asset files with per-file derived keys
 ├── AesFileEncryptor.kt      # AES crypto: key derivation, per-file key, encrypt, decrypt, per-project magic
