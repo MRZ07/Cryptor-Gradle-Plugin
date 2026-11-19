@@ -66,12 +66,14 @@ verify_bundle_assets() {
     local assets="$2"
     local encrypted="$3"
     local bundle="$4"
-    python3 - "$app" "$assets" "$encrypted" "$bundle" <<'PY'
+    local extra="$5"
+    python3 - "$app" "$assets" "$encrypted" "$bundle" "$extra" <<'PY'
 from pathlib import Path
 import sys
 
 app = sys.argv[1]
-assets, encrypted, bundle = map(Path, sys.argv[2:])
+assets, encrypted, bundle = map(Path, sys.argv[2:5])
+extra_fixtures = [p for p in sys.argv[5].split(",") if p]
 encrypted_extensions = {
     ".tmx", ".png", ".jpg", ".jpeg", ".atlas", ".pack", ".fnt", ".ttf",
     ".mp3", ".ogg", ".wav", ".map",
@@ -83,12 +85,7 @@ fixtures = sorted(
 if not fixtures:
     raise SystemExit(f"No configured Cryptor asset fixture under {assets}")
 samples = [fixtures[0]]
-if app == "SampleApp1":
-    samples.extend([
-        assets / "map/level/1/start.tmx",
-        assets / "ts/main.tsx",
-        assets / "i18n/bundle.properties",
-    ])
+samples.extend(assets / relative for relative in extra_fixtures)
 
 for source in samples:
     relative = source.relative_to(assets)
@@ -202,11 +199,25 @@ run_app() {
     local app="$1"
     local sound_relative="$2"
     local music_relative="$3"
+    local tmx_relative="$4"
+    local build_mode="${5:-include-build}"
+    local launch_env="${6:-}"
+    local extra_fixtures="${7:-}"
     local repo="$MRZ_ROOT/$app"
     local assets="$repo/assets"
     local properties="$repo/ios/robovm.properties"
     local gradle_log="$LOG_DIR/$app-gradle.log"
     local app_log="$LOG_DIR/$app.log"
+
+    if [[ "$tmx_relative" == "-" ]]; then
+        tmx_relative=""
+    fi
+    if [[ "$extra_fixtures" == "-" ]]; then
+        extra_fixtures=""
+    fi
+    if [[ -n "$launch_env" ]]; then
+        launch_env="SIMCTL_CHILD_$launch_env"
+    fi
 
     [[ -x "$repo/gradlew" ]] || fail "$app has no executable Gradle wrapper"
     [[ -f "$properties" ]] || fail "$app is missing ios/robovm.properties"
@@ -222,7 +233,7 @@ run_app() {
 
     echo "[$app] building simulator app..."
     local build_status=0
-    if [[ "$app" == "SampleApp1" ]]; then
+    if [[ "$build_mode" == "cryptor-include-build" ]]; then
         (cd "$repo" && CRYPTOR_PLUGIN_INCLUDE_BUILD="$PLUGIN_ROOT" ./gradlew \
             -Probovm.device.name="$simulator_name" \
             -Probovm.sdk.version="$IOS_VERSION" \
@@ -248,12 +259,7 @@ run_app() {
     printf '%s\n' "$build_info" | grep -Fq "platform IOSSIMULATOR" || fail "$app binary is not an iOS Simulator build"
     printf '%s\n' "$build_info" | grep -Fq "sdk $IOS_VERSION" || fail "$app binary was not built with iOS $IOS_VERSION SDK"
 
-    verify_bundle_assets "$app" "$assets" "$repo/ios/build/encryptedAssets" "$simulator_app"
-
-    local tmx_relative=""
-    if [[ "$app" == "SampleApp1" ]]; then
-        tmx_relative="map/level/1/start.tmx"
-    fi
+    verify_bundle_assets "$app" "$assets" "$repo/ios/build/encryptedAssets" "$simulator_app" "$extra_fixtures"
 
     xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
     xcrun simctl install "$simulator_udid" "$simulator_app"
@@ -266,8 +272,8 @@ run_app() {
     local launch_log_start
     launch_log_start="$(date '+%Y-%m-%d %H:%M:%S')"
     local launch_output
-    if [[ "$app" == "SampleApp1" ]]; then
-        launch_output="$(SIMCTL_CHILD_SW2_START_LEVEL=1 xcrun simctl launch "$simulator_udid" "$bundle_id")"
+    if [[ -n "$launch_env" ]]; then
+        launch_output="$(env "$launch_env" xcrun simctl launch "$simulator_udid" "$bundle_id")"
     else
         launch_output="$(xcrun simctl launch "$simulator_udid" "$bundle_id")"
     fi
@@ -338,11 +344,23 @@ run_app() {
     xcrun simctl terminate "$simulator_udid" "$bundle_id" >/dev/null 2>&1 || true
 }
 
-run_app SampleApp1 "sounds/ui/screen/title/start.mp3" "music/level/adventure2.mp3"
-run_app SampleApp2 "sounds/kick.mp3" "music/menu.mp3"
-run_app SampleApp3 "sounds/kick.mp3" "music/menu.mp3"
-run_app SampleApp4 "sounds/bump.mp3" "-"
-run_app SampleApp5 "sounds/bump.mp3" "-"
-run_app SampleApp6 "sounds/click.mp3" "music/menu.mp3"
+# The app list lives outside the repository: private project names must not be
+# published with the plugin. One tab-separated row per app:
+#   name<TAB>sound<TAB>music<TAB>tmx<TAB>build-mode<TAB>launch-env<TAB>extra-fixtures
+# Use "-" for an absent music, TMX, launch-env or extra-fixtures value.
+apps_config="${IOS_SMOKE_APPS_CONFIG:-$PLUGIN_ROOT/tools/ios-simulator-apps.local}"
+if [[ ! -f "$apps_config" ]]; then
+    echo "No app list at $apps_config."
+    echo "Copy tools/ios-simulator-apps.example to that path, or set IOS_SMOKE_APPS_CONFIG."
+    exit 0
+fi
+
+while IFS=$'\t' read -r app sound_relative music_relative tmx_relative build_mode launch_env extra_fixtures; do
+    if [[ -z "$app" || "$app" == "#"* ]]; then
+        continue
+    fi
+    run_app "$app" "$sound_relative" "$music_relative" "${tmx_relative:--}" \
+        "${build_mode:-include-build}" "${launch_env:--}" "${extra_fixtures:--}"
+done < "$apps_config"
 
 echo "All Cryptor iOS simulator smoke tests passed on iOS $IOS_VERSION. Logs: $LOG_DIR"

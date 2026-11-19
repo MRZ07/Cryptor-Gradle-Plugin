@@ -344,11 +344,14 @@ The plugin hooks into `AndroidComponentsExtension.onVariants` and runs an `encry
 
 ## iOS Simulator smoke tests
 
-The opt-in smoke runner builds and installs all six MRZ07 game apps on iOS 27.2, verifies the simulator binaries target the requested SDK, and checks encrypted bundle bytes plus freshly written decrypted sound caches; it checks music caches where the app starts music automatically. The plugin unit test exercises both sound and music delegates. SampleApp1 boots directly into level 1 and must log the TMX load.
+The opt-in smoke runner builds and installs the apps listed in a local, git-ignored app list on iOS 27.2, verifies the simulator binaries target the requested SDK, and checks encrypted bundle bytes plus freshly written decrypted sound caches; it checks music caches where the app starts music automatically. The plugin unit test exercises both sound and music delegates. An app that boots straight into a level declares its TMX fixture in the list and must log that map load at startup.
 
 Requirements: macOS, Xcode with the matching iOS Simulator runtime, JDK 21, and `simctl`. The runner does not download runtimes, erase simulator data, uninstall apps, or require the Simulator GUI app. It writes logs and screenshots to a temporary directory. It includes the local plugin checkout as a Gradle composite build so the smoke suite tests the checked-out plugin source.
 
+The app list lives in `tools/ios-simulator-apps.local`, which is git-ignored so private project names never land in this repository. Copy `tools/ios-simulator-apps.example`, one tab-separated row per app: name, sound fixture, music fixture, TMX fixture, build mode, launch environment entry, and extra encrypted fixtures (`-` where a value does not apply). Set `IOS_SMOKE_APPS_CONFIG` to point at a different file.
+
 ```bash
+cp tools/ios-simulator-apps.example tools/ios-simulator-apps.local   # then edit
 SIMULATOR_UDID=<ios-27.2-iphone-udid> tools/ios-simulator-smoke.sh
 ```
 

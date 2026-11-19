@@ -1,0 +1,15 @@
+# Example iOS simulator smoke app list.
+# Copy to tools/ios-simulator-apps.local (git-ignored) and describe your own apps.
+# One tab-separated row per app:
+#   name<TAB>sound fixture<TAB>music fixture<TAB>TMX fixture<TAB>build mode<TAB>launch env<TAB>extra fixtures
+# Use "-" where a value does not apply.
+#   name            directory name of the sibling project; it must sit next to this repository
+#   sound fixture   asset path the app plays at startup, relative to <name>/assets
+#   music fixture   asset path of automatically started music, or "-"
+#   TMX fixture     level map the app must log as loaded at startup, or "-"
+#   build mode      "include-build" (--include-build the plugin checkout) or
+#                   "cryptor-include-build" (CRYPTOR_PLUGIN_INCLUDE_BUILD=<plugin checkout>)
+#   launch env      environment entry without the SIMCTL_CHILD_ prefix, or "-"
+#   extra fixtures  comma-separated asset paths that must also be encrypted and packaged, or "-"
+ExampleApp	sounds/click.mp3	music/menu.mp3	-	include-build	-	-
+ExampleGame	sounds/start.mp3	music/theme.mp3	maps/level1.tmx	cryptor-include-build	EXAMPLE_START_LEVEL=1	maps/level1.tmx,atlas/ui.atlas
