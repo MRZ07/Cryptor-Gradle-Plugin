@@ -1,4 +1,5 @@
 import org.gradle.api.DefaultTask
+import org.gradle.api.GradleException
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.provider.ListProperty
 import org.gradle.api.provider.Property
@@ -39,14 +40,51 @@ abstract class EncryptAssetsTask : DefaultTask() {
             if (src.extension.lowercase() in exts) {
                 val raw = src.readBytes()
                 if (AesFileEncryptor.hasMagic(raw, masterKey)) {
+                    if (!AesFileEncryptor.isWellFormed(raw)) {
+                        throw GradleException(
+                            "Cryptor: asset '$relative' is encrypted but not in the current asset format " +
+                                "(stale output from an older Cryptor version or a truncated file). " +
+                                "Clean the build and rebuild."
+                        )
+                    }
                     dest.writeBytes(raw)
                 } else {
                     val relPath = relative.path.replace(File.separatorChar, '/')
-                    dest.writeBytes(AesFileEncryptor.encrypt(raw, masterKey, relPath))
+                    val encrypted = AesFileEncryptor.encrypt(raw, masterKey, relPath)
+                    dest.writeBytes(encrypted)
+                    verifyRoundTrip(relPath, raw, encrypted, masterKey)
                 }
             } else {
                 src.copyTo(dest, overwrite = true)
             }
+        }
+    }
+
+    /**
+     * Fails the build when an encrypted asset does not decrypt back to its source bytes.
+     *
+     * The runtime can only report corruption after a user installs the app; a broken key, a
+     * truncated write or a format drift must stop the build instead.
+     */
+    private fun verifyRoundTrip(
+        relativePath: String,
+        plaintext: ByteArray,
+        encrypted: ByteArray,
+        masterKey: ByteArray,
+    ) {
+        val decrypted = try {
+            AesFileEncryptor.decrypt(encrypted, masterKey, relativePath)
+        } catch (failure: RuntimeException) {
+            throw GradleException(
+                "Cryptor: asset '$relativePath' does not decrypt back to its source (${failure.message})",
+                failure
+            )
+        }
+        if (!decrypted.contentEquals(plaintext)) {
+            throw GradleException(
+                "Cryptor: asset '$relativePath' does not decrypt back to its source " +
+                    "(${plaintext.size} source bytes, ${decrypted.size} decrypted bytes)"
+            )
         }
     }
 }

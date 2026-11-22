@@ -65,7 +65,19 @@ class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
          * Non-encrypted files (hasMagic = false) are returned as-is.
          */
         private val decrypted: ByteArray by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
-            if (encrypted) AesFileEncryptor.decrypt(rawBytes, masterKey(), normPath()) else rawBytes
+            val bytes = if (encrypted) {
+                try {
+                    AesFileEncryptor.decrypt(rawBytes, masterKey(), normPath())
+                } catch (failure: AesFileEncryptor.AssetCorruptionException) {
+                    CryptorDiagnostics.log("corrupt asset: ${normPath()} (${rawBytes.size} bytes)")
+                    throw failure
+                }
+            } else {
+                CryptorDiagnostics.log("not encrypted for this key: ${normPath()} (${rawBytes.size} bytes)")
+                rawBytes
+            }
+            CryptorDiagnostics.log("decrypted: ${normPath()} (${rawBytes.size} -> ${bytes.size} bytes)")
+            bytes
         }
 
         override fun read(): InputStream    = ByteArrayInputStream(decrypted)

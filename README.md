@@ -78,8 +78,9 @@ assets/  (raw)
     │    2. Derive file key:            SHA-256(masterKey ∥ relativePath)[0:16]
     │    3. Generate random 16-byte IV (SecureRandom)
     │    4. Encrypt with AES-128-CTR
-    │    5. Prepend header: [magic(4)] [IV(16)] [ciphertext]
+    │    5. Prepend header: [magic(4)] [plainLength(4)] [IV(16)] [ciphertext]
     │       magic = SHA-256(masterKey)[0:4]  — unique per project key
+    │       plainLength makes a truncated or padded asset detectable at runtime
     │  Audio / unsupported extensions: copied as-is
     ▼
 build/encryptedAssets/  → wired directly into the jar task
@@ -99,6 +100,8 @@ build/encryptedAssets/  → wired directly into the jar task
 - **ProGuard/R8 compatible** — no keep-rule needed; ProGuard further renames the already-obfuscated decryptor
 - **Asset encryption** — **AES-128-CTR** with per-file derived keys and random IV per file; known-plaintext attack cannot recover the key
 - **Per-project magic header** — derived from `SHA-256(masterKey)[0:4]`; each project has unique file identification bytes — no fixed byte pattern to grep for
+- **Corruption detection** — the header stores the plaintext length, and AES-CTR is length preserving, so a truncated or padded asset raises `AssetCorruptionException` naming the file and both sizes instead of being decrypted into a shorter stream and handed to a decoder as "not of any known type"
+- **Build-time round trip** — every encrypted asset is decrypted back and compared with its source; a mismatch fails the build instead of reaching a device
 - **Obfuscated wrapper class names** — `CryptorFilesWrapper` and `CryptorAudioWrapper` are renamed to key-derived names at build time, just like the string decryptor
 - **Arithmetic key veil** — the four AES key Int fields are injected as `VEIL XOR part` pairs, not raw constants; no single bytecode value reveals a key part
 - **ProGuard-safe activation** — wrappers wired into `Gdx.files` / `Gdx.audio` via direct ASM bytecode injection into `create()` and `resume()`, not reflection
@@ -418,7 +421,8 @@ The task is a no-op when `enabled = false`. A local build that needs the default
 | `v1.9.23` | stable | JVM asset filter matches extensions case-insensitively; encrypted output dir resolved through the task provider |
 | `v1.9.24` | stable | Android: `compress<Variant>Assets` is always re-run and never build-cached, so a changed `assetExtensions` cannot ship plaintext; encryption now fails the build if any configured asset is left unencrypted |
 | `v1.9.25` | stable | Adds `cryptorKeyCheck` — fails when the key is still the public default; `DEFAULT_KEY` is exposed as a constant |
-| `v1.9.26` | ✅ **latest** | RoboVM/iOS: package a generated encrypted resource tree and decrypt real-file/audio reads through LibGDX's writable local directory |
+| `v1.9.26` | stable | RoboVM/iOS: package a generated encrypted resource tree and decrypt real-file/audio reads through LibGDX's writable local directory |
+| `v1.9.27` | ✅ **latest** | Corrupt-asset detection (plaintext length in the header), build-time decrypt round trip, atomic audio publish with one retry |
 
 ---
 
@@ -451,7 +455,7 @@ assets/  (raw)
     │     a. fileKey = SHA-256(masterKey ∥ relativePath)[0:16]
     │     b. IV      = SecureRandom 16 bytes
     │     c. magic   = SHA-256(masterKey)[0:4]  ← unique per project
-    │     d. output  = magic + IV + AES-128-CTR(fileKey, IV, plaintext)
+    │     d. output  = magic + plainLength + IV + AES-128-CTR(fileKey, IV, plaintext)
     │  3. Unsupported extensions: copied as-is
     ▼
 build/encryptedAssets/  → wired into jar task; raw copies excluded

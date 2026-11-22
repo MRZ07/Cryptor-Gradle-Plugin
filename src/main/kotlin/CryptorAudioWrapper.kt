@@ -29,6 +29,9 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
         private val audioFileCache = ConcurrentHashMap<String, File>()
         private val cleanupDone = AtomicBoolean(false)
 
+        /** Sibling written before the published file so a reader never sees a partial copy. */
+        private const val PART_SUFFIX = ".part"
+
         internal fun usesIOSLocalCache(): Boolean =
             Gdx.app?.type == Application.ApplicationType.iOS
 
@@ -112,10 +115,10 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
     }
 
     override fun newSound(fileHandle: FileHandle): Sound =
-        delegate.newSound(toAbsoluteTempHandle(fileHandle))
+        createGuarded(fileHandle) { delegate.newSound(it) }
 
     override fun newMusic(fileHandle: FileHandle): Music =
-        delegate.newMusic(toAbsoluteTempHandle(fileHandle))
+        createGuarded(fileHandle) { delegate.newMusic(it) }
 
     private fun toAbsoluteTempHandle(fileHandle: FileHandle): FileHandle {
         val path   = fileHandle.path()
@@ -144,19 +147,61 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
             throw GdxRuntimeException("Decrypted audio file is empty: $path")
         }
 
-        val file = File(resolveAudioDir(), buildCacheFileName(path))
-        FileOutputStream(file).use { output ->
+        val file = publish(bytes, File(resolveAudioDir(), buildCacheFileName(path)), path)
+        audioFileCache[path] = file
+        CryptorDiagnostics.log("audio materialized: $path (${bytes.size} bytes) -> ${file.absolutePath}")
+        return Gdx.files.absolute(file.absolutePath)
+    }
+
+    /**
+     * Writes [bytes] to [target] through a sibling `.part` file and renames it into place.
+     *
+     * A backend that opens the file while it is still being written reports "Error loading audio
+     * file" with no further detail, so the published file is never observed half-written.
+     */
+    private fun publish(bytes: ByteArray, target: File, path: String): File {
+        val partial = File(target.parentFile, target.name + PART_SUFFIX)
+        FileOutputStream(partial).use { output ->
             output.write(bytes)
             output.flush()
             output.fd.sync()
         }
-        if (file.length() != bytes.size.toLong()) {
-            file.delete()
+        if (partial.length() != bytes.size.toLong()) {
+            partial.delete()
             throw GdxRuntimeException(
-                "Audio size mismatch for $path (expected ${bytes.size}, got ${file.length()})"
+                "Audio size mismatch for $path (expected ${bytes.size}, got ${partial.length()})"
             )
         }
-        audioFileCache[path] = file
-        return Gdx.files.absolute(file.absolutePath)
+        if (target.exists()) target.delete()
+        if (!partial.renameTo(target)) {
+            partial.delete()
+            throw GdxRuntimeException("Could not publish decrypted audio for $path -> ${target.absolutePath}")
+        }
+        return target
+    }
+
+    /** Drops a materialized copy the backend rejected so the next call rebuilds it. */
+    private fun invalidate(path: String): Boolean {
+        val cached = audioFileCache.remove(path) ?: return false
+        val deleted = cached.delete()
+        CryptorDiagnostics.log("audio copy invalidated: $path (deleted=$deleted)")
+        return true
+    }
+
+    private fun <T> createGuarded(fileHandle: FileHandle, create: (FileHandle) -> T): T {
+        val handle = toAbsoluteTempHandle(fileHandle)
+        return try {
+            create(handle)
+        } catch (failure: RuntimeException) {
+            // A copy can be rejected after a storage-pressure eviction or a failed publish. Rebuild
+            // it once from the still-readable source before the caller's own fallback takes over.
+            if (!invalidate(fileHandle.path())) throw failure
+            try {
+                create(toAbsoluteTempHandle(fileHandle))
+            } catch (retry: RuntimeException) {
+                retry.addSuppressed(failure)
+                throw retry
+            }
+        }
     }
 }

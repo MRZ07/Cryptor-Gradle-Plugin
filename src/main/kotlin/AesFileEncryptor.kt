@@ -8,14 +8,27 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * AES-128-CTR asset encryption with per-file derived keys and per-project magic.
  *
- * Header layout (20 bytes):
+ * Header layout (24 bytes):
  *   [0..3]   magic = sha256(masterKey)[0:4]  — unique per project key
- *   [4..19]  random IV (16 bytes)
- *   [20..]   AES-128-CTR ciphertext
+ *   [4..7]   plaintext length (big endian)
+ *   [8..23]  random IV (16 bytes)
+ *   [24..]   AES-128-CTR ciphertext
+ *
+ * AES-CTR is length preserving, so the stored plaintext length is a free integrity check: a
+ * truncated or padded asset (an interrupted install, a partial copy, a bad packaging step) is
+ * reported as corruption instead of being decrypted into a shorter stream and handed to a
+ * decoder as "not of any known type".
  */
 object AesFileEncryptor {
 
-    const val HEADER_SIZE = 20  // 4 magic + 16 IV
+    const val MAGIC_SIZE = 4
+    const val LENGTH_SIZE = 4
+    const val IV_SIZE = 16
+    const val HEADER_SIZE = MAGIC_SIZE + LENGTH_SIZE + IV_SIZE  // 24
+    private const val IV_OFFSET = MAGIC_SIZE + LENGTH_SIZE
+
+    /** An encrypted asset whose stored plaintext length does not match its ciphertext length. */
+    class AssetCorruptionException(message: String) : RuntimeException(message)
 
     // -------------------------------------------------------------------------
     // Key derivation
@@ -35,7 +48,7 @@ object AesFileEncryptor {
     }
 
     /** Per-project magic: first 4 bytes of SHA-256(masterKey). */
-    fun deriveMagic(masterKey: ByteArray): ByteArray = sha256(masterKey).copyOf(4)
+    fun deriveMagic(masterKey: ByteArray): ByteArray = sha256(masterKey).copyOf(MAGIC_SIZE)
 
     // -------------------------------------------------------------------------
     // Encrypt / Decrypt
@@ -44,14 +57,28 @@ object AesFileEncryptor {
     fun encrypt(data: ByteArray, masterKey: ByteArray, relativePath: String): ByteArray {
         val magic   = deriveMagic(masterKey)
         val fileKey = deriveFileKey(masterKey, relativePath)
-        val iv      = ByteArray(16).also { SecureRandom().nextBytes(it) }
-        return magic + iv + aesCtr(data, fileKey, iv, Cipher.ENCRYPT_MODE)
+        val iv      = ByteArray(IV_SIZE).also { SecureRandom().nextBytes(it) }
+        val header  = ByteBuffer.allocate(HEADER_SIZE)
+            .put(magic)
+            .putInt(data.size)
+            .put(iv)
+            .array()
+        return header + aesCtr(data, fileKey, iv, Cipher.ENCRYPT_MODE)
     }
 
     fun decrypt(raw: ByteArray, masterKey: ByteArray, relativePath: String): ByteArray {
         if (!hasMagic(raw, masterKey)) return raw
-        val iv         = raw.copyOfRange(4, 20)
-        val ciphertext = raw.copyOfRange(20, raw.size)
+        val storedLength = ByteBuffer.wrap(raw, MAGIC_SIZE, LENGTH_SIZE).int
+        val ciphertextLength = raw.size - HEADER_SIZE
+        if (storedLength < 0 || ciphertextLength != storedLength) {
+            throw AssetCorruptionException(
+                "Encrypted asset '${relativePath.replace('\\', '/')}' is corrupt: header declares " +
+                    "$storedLength plaintext bytes but the file carries $ciphertextLength. " +
+                    "Reinstall the app; if it persists the shipped asset is truncated."
+            )
+        }
+        val iv         = raw.copyOfRange(IV_OFFSET, HEADER_SIZE)
+        val ciphertext = raw.copyOfRange(HEADER_SIZE, raw.size)
         val fileKey    = deriveFileKey(masterKey, relativePath)
         return aesCtr(ciphertext, fileKey, iv, Cipher.DECRYPT_MODE)
     }
@@ -61,6 +88,19 @@ object AesFileEncryptor {
         val magic = deriveMagic(masterKey)
         return raw[0] == magic[0] && raw[1] == magic[1] &&
                raw[2] == magic[2] && raw[3] == magic[3]
+    }
+
+    /**
+     * Whether [raw] carries a complete current-format header.
+     *
+     * AES-CTR is length preserving, so the stored plaintext length must equal the ciphertext
+     * length. A file that has the magic but not the invariant is an older format or a truncated
+     * copy; the build treats it as a stale artefact instead of shipping it.
+     */
+    fun isWellFormed(raw: ByteArray): Boolean {
+        if (raw.size < HEADER_SIZE) return false
+        val storedLength = ByteBuffer.wrap(raw, MAGIC_SIZE, LENGTH_SIZE).int
+        return storedLength >= 0 && raw.size - HEADER_SIZE == storedLength
     }
 
     // -------------------------------------------------------------------------

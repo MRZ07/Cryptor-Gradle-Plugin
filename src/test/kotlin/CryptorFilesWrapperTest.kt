@@ -11,6 +11,7 @@ import java.io.InputStream
 import java.lang.reflect.Proxy
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertEquals
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -115,6 +116,59 @@ class CryptorFilesWrapperTest {
 
             assertSame(backingFile, result)
             assertEquals(0, source.readCount)
+        } finally {
+            Gdx.app = previousApp
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun truncatedEncryptedAssetIsReportedInsteadOfDecrypted() {
+        val root = tempRoot("cryptor-truncated")
+        val previousApp = Gdx.app
+        val masterKey = ByteArray(16)
+        val assetPath = "hud/Coin_Icon.png"
+        val plainBytes = ByteArray(64) { it.toByte() }
+        val encrypted = AesFileEncryptor.encrypt(plainBytes, masterKey, assetPath)
+        val truncated = encrypted.copyOf(encrypted.size - 8)
+        val source = MemoryInternalFileHandle(assetPath, truncated, File(root, "bundle/$assetPath"))
+        val files = proxy<Files>(Files::class.java) { method, _ ->
+            if (method.name == "internal") source else null
+        }
+
+        try {
+            Gdx.app = application(Application.ApplicationType.Android)
+            val failure = assertFailsWith<AesFileEncryptor.AssetCorruptionException> {
+                CryptorFilesWrapper(files).internal(assetPath).readBytes()
+            }
+            assertTrue(
+                failure.message!!.contains(assetPath) && failure.message!!.contains("${plainBytes.size}"),
+                "the message must name the asset and both sizes: ${failure.message}"
+            )
+        } finally {
+            Gdx.app = previousApp
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun paddedEncryptedAssetIsReportedInsteadOfDecrypted() {
+        val root = tempRoot("cryptor-padded")
+        val previousApp = Gdx.app
+        val masterKey = ByteArray(16)
+        val assetPath = "music/level.mp3"
+        val encrypted = AesFileEncryptor.encrypt(ByteArray(32), masterKey, assetPath)
+        val padded = encrypted + ByteArray(4)
+        val source = MemoryInternalFileHandle(assetPath, padded, File(root, "bundle/$assetPath"))
+        val files = proxy<Files>(Files::class.java) { method, _ ->
+            if (method.name == "internal") source else null
+        }
+
+        try {
+            Gdx.app = application(Application.ApplicationType.Android)
+            assertFailsWith<AesFileEncryptor.AssetCorruptionException> {
+                CryptorFilesWrapper(files).internal(assetPath).readBytes()
+            }
         } finally {
             Gdx.app = previousApp
             root.deleteRecursively()
