@@ -663,9 +663,17 @@ abstract class EncryptClassesTask : DefaultTask() {
         }
 
         // ---- AesFileEncryptor: copy as-is (used by CryptorFileHandle at runtime) ----
-        // Not renamed because ProGuard updates all references consistently.
-        classLoader.getResourceAsStream("AesFileEncryptor.class")?.readBytes()?.let { bytes ->
-            File(outputDir, "AesFileEncryptor.class").writeBytes(bytes)
+        // Not renamed because ProGuard updates all references consistently. Nested and
+        // generated classes must be copied too: a missing one only shows up as an
+        // unresolved reference in the consumer's release build.
+        listOf(
+            "AesFileEncryptor.class",
+            "AesFileEncryptor\$AssetCorruptionException.class",
+            "CryptorDiagnostics.class",
+        ).forEach { resource ->
+            classLoader.getResourceAsStream(resource)?.readBytes()?.let { bytes ->
+                File(outputDir, resource).writeBytes(bytes)
+            } ?: error("$resource not found in plugin JAR; the consumer build would fail on a missing reference")
         }
     }
 

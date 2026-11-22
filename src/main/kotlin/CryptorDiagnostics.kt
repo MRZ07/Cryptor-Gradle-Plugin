@@ -10,9 +10,9 @@ import com.badlogic.gdx.Gdx
  */
 internal object CryptorDiagnostics {
 
-    private val enabled: Boolean by lazy {
-        System.getProperty("cryptor.diagnostics")?.toBoolean() == true
-    }
+    // Read once, without a lazy delegate: the plugin copies this class into the consumer jar by
+    // name, and an extra generated class would have to be copied as well.
+    private val enabled: Boolean = System.getProperty("cryptor.diagnostics")?.toBoolean() == true
 
     fun log(message: String) {
         if (!enabled) return

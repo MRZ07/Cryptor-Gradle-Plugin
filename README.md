@@ -422,7 +422,8 @@ The task is a no-op when `enabled = false`. A local build that needs the default
 | `v1.9.24` | stable | Android: `compress<Variant>Assets` is always re-run and never build-cached, so a changed `assetExtensions` cannot ship plaintext; encryption now fails the build if any configured asset is left unencrypted |
 | `v1.9.25` | stable | Adds `cryptorKeyCheck` — fails when the key is still the public default; `DEFAULT_KEY` is exposed as a constant |
 | `v1.9.26` | stable | RoboVM/iOS: package a generated encrypted resource tree and decrypt real-file/audio reads through LibGDX's writable local directory |
-| `v1.9.27` | ✅ **latest** | Corrupt-asset detection (plaintext length in the header), build-time decrypt round trip, atomic audio publish with one retry |
+| `v1.9.27` | superseded | Corrupt-asset detection, build-time decrypt round trip, atomic audio publish; the injected runtime class set was incomplete, so release builds failed on an unresolved reference |
+| `v1.9.28` | ✅ **latest** | Ships every injected runtime class (`AesFileEncryptor$AssetCorruptionException`, `CryptorDiagnostics`) |
 
 ---
 
