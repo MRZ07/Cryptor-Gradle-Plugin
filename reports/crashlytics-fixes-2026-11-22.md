@@ -57,6 +57,7 @@ an Android report is actionable through the normal Crashlytics path.
 | `v1.9.27` | `13b4600` | The fix above. **Superseded** — the injected runtime class set was not extended, so a consumer release build failed on unresolved `AesFileEncryptor$AssetCorruptionException` / `CryptorDiagnostics` references. |
 | `v1.9.28` | `4ba6e3f` | The released version. Copies every injected runtime class and fails loudly when one is missing. |
 | `v1.9.29` | pending | Prevents short magic-prefixed assets from passing as plaintext, shares Android/JVM format validation, and hardens locale-safe key derivation and concurrent audio cache publication. |
+| `v1.9.30` | pending | Serializes non-iOS audio cache invalidation with materialization so invalidation cannot delete a newly rematerialized file. |
 
 `v1.9.27` was not re-tagged: JitPack builds tags immutably, so a new tag was the
 only honest way to publish the corrected class set.
@@ -106,3 +107,11 @@ classification treats any matching magic prefix as encrypted, including truncate
 headers, while Android and JVM builds share the same current-format validation and
 round-trip helper. Audio cache publication uses unique synced sibling files, with
 serialized desktop materialization and iOS cache invalidation on one retry.
+
+## v1.9.30 addendum
+
+Non-iOS audio invalidation now removes the cached entry and deletes its file while
+holding the same `audioFileCache` monitor used by materialization. This prevents an
+invalidation from deleting a replacement file published concurrently for the same
+asset. A focused concurrency test verifies invalidation waits for that cache lock and
+then removes the cached copy.

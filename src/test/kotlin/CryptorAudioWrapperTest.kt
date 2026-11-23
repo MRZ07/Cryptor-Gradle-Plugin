@@ -9,6 +9,7 @@ import java.lang.reflect.Proxy
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -203,6 +204,97 @@ class CryptorAudioWrapperTest {
             second.get(10, TimeUnit.SECONDS)
         } finally {
             executor.shutdownNow()
+            Gdx.files = previousFiles
+            Gdx.app = previousApp
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun desktopInvalidationWaitsForMaterializationLockBeforeDeletingCachedFile() {
+        val root = File(
+            System.getProperty("java.io.tmpdir"),
+            "cryptor-audio-invalidation-${System.nanoTime()}"
+        )
+        val previousFiles = Gdx.files
+        val previousApp = Gdx.app
+        val plainBytes = byteArrayOf(3, 1, 4, 1, 5)
+        val track = File(root, "music/invalidation.mp3")
+        var publishedPath: String? = null
+        val audio = Proxy.newProxyInstance(
+            Audio::class.java.classLoader,
+            arrayOf(Audio::class.java)
+        ) { _, method, args ->
+            when (method.name) {
+                "newMusic" -> {
+                    val handle = args!![0] as FileHandle
+                    publishedPath = handle.path()
+                    proxyOf(Music::class.java)
+                }
+                else -> throw UnsupportedOperationException("Unexpected Audio call: ${method.name}")
+            }
+        } as Audio
+        val files = Proxy.newProxyInstance(
+            Files::class.java.classLoader,
+            arrayOf(Files::class.java)
+        ) { _, method, args ->
+            when (method.name) {
+                "absolute" -> FileHandle(File(args!![0] as String))
+                else -> throw UnsupportedOperationException("Unexpected Files call: ${method.name}")
+            }
+        } as Files
+        val executor = Executors.newSingleThreadExecutor()
+        var cachedFile: File? = null
+
+        try {
+            root.mkdirs()
+            track.parentFile.mkdirs()
+            track.writeBytes(plainBytes)
+            Gdx.files = files
+            Gdx.app = null
+            val wrapper = CryptorAudioWrapper(audio)
+            wrapper.newMusic(FileHandle(track))
+            val published = File(requireNotNull(publishedPath))
+            cachedFile = published
+            assertTrue(published.isFile)
+
+            val cacheField = CryptorAudioWrapper::class.java.getDeclaredField("audioFileCache").apply {
+                isAccessible = true
+            }
+            val cacheLock = cacheField.get(null)
+            val invalidate = CryptorAudioWrapper::class.java
+                .getDeclaredMethod("invalidate", String::class.java)
+                .apply { isAccessible = true }
+            val workerThread = AtomicReference<Thread>()
+            val started = CountDownLatch(1)
+            val invalidation = synchronized(cacheLock) {
+                val result = executor.submit<Boolean> {
+                    workerThread.set(Thread.currentThread())
+                    started.countDown()
+                    invalidate.invoke(wrapper, track.path) as Boolean
+                }
+                assertTrue(started.await(5, TimeUnit.SECONDS), "invalidation worker should start")
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                while (workerThread.get().state != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+                    Thread.yield()
+                }
+                assertEquals(
+                    Thread.State.BLOCKED,
+                    workerThread.get().state,
+                    "invalidation must wait on the materialization cache lock"
+                )
+                result
+            }
+
+            assertTrue(invalidation.get(5, TimeUnit.SECONDS))
+            assertFalse(published.exists(), "invalidation should delete the cached copy")
+
+            wrapper.newMusic(FileHandle(track))
+            assertTrue(published.isFile, "the next call should safely rematerialize the copy")
+            assertContentEquals(plainBytes, published.readBytes())
+        } finally {
+            executor.shutdownNow()
+            cachedFile?.delete()
             Gdx.files = previousFiles
             Gdx.app = previousApp
             root.deleteRecursively()

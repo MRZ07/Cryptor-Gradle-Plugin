@@ -200,10 +200,12 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
             }
             return true
         }
-        val cached = audioFileCache.remove(path) ?: return false
-        val deleted = cached.delete()
-        CryptorDiagnostics.log("audio copy invalidated: $path (deleted=$deleted)")
-        return true
+        synchronized(audioFileCache) {
+            val cached = audioFileCache.remove(path) ?: return false
+            val deleted = cached.delete()
+            CryptorDiagnostics.log("audio copy invalidated: $path (deleted=$deleted)")
+            return true
+        }
     }
 
     private fun <T> createGuarded(fileHandle: FileHandle, create: (FileHandle) -> T): T {
