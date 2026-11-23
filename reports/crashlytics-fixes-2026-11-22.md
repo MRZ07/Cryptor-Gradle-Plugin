@@ -56,6 +56,7 @@ an Android report is actionable through the normal Crashlytics path.
 |---|---|---|
 | `v1.9.27` | `13b4600` | The fix above. **Superseded** — the injected runtime class set was not extended, so a consumer release build failed on unresolved `AesFileEncryptor$AssetCorruptionException` / `CryptorDiagnostics` references. |
 | `v1.9.28` | `4ba6e3f` | The released version. Copies every injected runtime class and fails loudly when one is missing. |
+| `v1.9.29` | pending | Prevents short magic-prefixed assets from passing as plaintext, shares Android/JVM format validation, and hardens locale-safe key derivation and concurrent audio cache publication. |
 
 `v1.9.27` was not re-tagged: JitPack builds tags immutably, so a new tag was the
 only honest way to publish the corrected class set.
@@ -98,7 +99,10 @@ why none of its assets carry the magic.
   no release-key guard of its own.
 - `CryptorDiagnostics` is a JVM system property, so it is reachable on desktop and
   iOS but not on Android. The exception message is the Android evidence path.
-- `AesFileEncryptor.deriveFileKey` lowercases the path and uses it verbatim. A path
-  that differs between build and runtime (for example a non-ASCII asset name handled
-  differently by a packaging step) silently produces a different key. The build-time
-  round trip cannot catch it because both sides run in the same process.
+## v1.9.29 addendum
+
+Build and runtime path/extension normalization now uses `Locale.ROOT`. Runtime
+classification treats any matching magic prefix as encrypted, including truncated
+headers, while Android and JVM builds share the same current-format validation and
+round-trip helper. Audio cache publication uses unique synced sibling files, with
+serialized desktop materialization and iOS cache invalidation on one retry.

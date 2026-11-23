@@ -8,6 +8,7 @@ import com.badlogic.gdx.utils.GdxRuntimeException
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -48,7 +49,7 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
                 .joinToString("") { "%02x".format(it) }
             val ext = normalized.substringAfterLast('.', "")
                 .takeIf { it.isNotEmpty() && !it.contains('/') }
-                ?.let { ".${it.lowercase()}" }
+                ?.let { ".${it.lowercase(Locale.ROOT)}" }
                 ?: ""
             return "cryptor_${digest}${ext}"
         }
@@ -137,20 +138,22 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
             return Gdx.files.absolute(localFile.file().absolutePath)
         }
 
-        val cached = audioFileCache[path]
-        if (cached != null && cached.exists() && cached.length() > 0L) {
-            return Gdx.files.absolute(cached.absolutePath)
-        }
+        synchronized(audioFileCache) {
+            val cached = audioFileCache[path]
+            if (cached != null && cached.exists() && cached.length() > 0L) {
+                return Gdx.files.absolute(cached.absolutePath)
+            }
 
-        val bytes = fileHandle.readBytes()
-        if (bytes.isEmpty()) {
-            throw GdxRuntimeException("Decrypted audio file is empty: $path")
-        }
+            val bytes = fileHandle.readBytes()
+            if (bytes.isEmpty()) {
+                throw GdxRuntimeException("Decrypted audio file is empty: $path")
+            }
 
-        val file = publish(bytes, File(resolveAudioDir(), buildCacheFileName(path)), path)
-        audioFileCache[path] = file
-        CryptorDiagnostics.log("audio materialized: $path (${bytes.size} bytes) -> ${file.absolutePath}")
-        return Gdx.files.absolute(file.absolutePath)
+            val file = publish(bytes, File(resolveAudioDir(), buildCacheFileName(path)), path)
+            audioFileCache[path] = file
+            CryptorDiagnostics.log("audio materialized: $path (${bytes.size} bytes) -> ${file.absolutePath}")
+            return Gdx.files.absolute(file.absolutePath)
+        }
     }
 
     /**
@@ -160,28 +163,43 @@ class CryptorAudioWrapper(private val delegate: Audio) : Audio by delegate {
      * file" with no further detail, so the published file is never observed half-written.
      */
     private fun publish(bytes: ByteArray, target: File, path: String): File {
-        val partial = File(target.parentFile, target.name + PART_SUFFIX)
-        FileOutputStream(partial).use { output ->
-            output.write(bytes)
-            output.flush()
-            output.fd.sync()
+        val partial = File.createTempFile(target.name + ".", PART_SUFFIX, target.parentFile)
+        try {
+            FileOutputStream(partial).use { output ->
+                output.write(bytes)
+                output.flush()
+                output.fd.sync()
+            }
+            if (partial.length() != bytes.size.toLong()) {
+                throw GdxRuntimeException(
+                    "Audio size mismatch for $path (expected ${bytes.size}, got ${partial.length()})"
+                )
+            }
+            if (!partial.renameTo(target)) {
+                if (target.exists()) target.delete()
+                if (!partial.renameTo(target)) {
+                    throw GdxRuntimeException(
+                        "Could not publish decrypted audio for $path -> ${target.absolutePath}"
+                    )
+                }
+            }
+            return target
+        } finally {
+            if (partial.exists()) partial.delete()
         }
-        if (partial.length() != bytes.size.toLong()) {
-            partial.delete()
-            throw GdxRuntimeException(
-                "Audio size mismatch for $path (expected ${bytes.size}, got ${partial.length()})"
-            )
-        }
-        if (target.exists()) target.delete()
-        if (!partial.renameTo(target)) {
-            partial.delete()
-            throw GdxRuntimeException("Could not publish decrypted audio for $path -> ${target.absolutePath}")
-        }
-        return target
     }
 
     /** Drops a materialized copy the backend rejected so the next call rebuilds it. */
     private fun invalidate(path: String): Boolean {
+        if (usesIOSLocalCache()) {
+            val cacheKey = "audio:${path.replace('\\', '/')}"
+            synchronized(materializedCache) {
+                val cached = materializedCache.remove(cacheKey)
+                val deleted = cached?.delete() ?: false
+                CryptorDiagnostics.log("audio copy invalidated: $path (deleted=$deleted)")
+            }
+            return true
+        }
         val cached = audioFileCache.remove(path) ?: return false
         val deleted = cached.delete()
         CryptorDiagnostics.log("audio copy invalidated: $path (deleted=$deleted)")

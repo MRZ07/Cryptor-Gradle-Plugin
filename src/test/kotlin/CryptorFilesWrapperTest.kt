@@ -152,6 +152,31 @@ class CryptorFilesWrapperTest {
     }
 
     @Test
+    fun magicPrefixedAssetShorterThanHeaderIsReportedByWrapper() {
+        val root = tempRoot("cryptor-short-magic")
+        val previousApp = Gdx.app
+        val masterKey = ByteArray(16)
+        val assetPath = "images/short.png"
+        val truncated = AesFileEncryptor.deriveMagic(masterKey) + ByteArray(7)
+        val source = MemoryInternalFileHandle(assetPath, truncated, File(root, "bundle/$assetPath"))
+        val files = proxy<Files>(Files::class.java) { method, _ ->
+            if (method.name == "internal") source else null
+        }
+
+        try {
+            Gdx.app = application(Application.ApplicationType.Android)
+            val failure = assertFailsWith<AesFileEncryptor.AssetCorruptionException> {
+                CryptorFilesWrapper(files).internal(assetPath).readBytes()
+            }
+            assertTrue(failure.message!!.contains(assetPath))
+            assertTrue(failure.message!!.contains("${truncated.size} bytes"))
+        } finally {
+            Gdx.app = previousApp
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun paddedEncryptedAssetIsReportedInsteadOfDecrypted() {
         val root = tempRoot("cryptor-padded")
         val previousApp = Gdx.app

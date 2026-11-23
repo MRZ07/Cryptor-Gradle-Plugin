@@ -1,7 +1,9 @@
 import java.io.File
+import org.gradle.api.GradleException
 import org.gradle.testfixtures.ProjectBuilder
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 class EncryptAssetsTaskTest {
@@ -54,6 +56,37 @@ class EncryptAssetsTaskTest {
             )
             assertContentEquals(imageBytes, image.readBytes())
             assertContentEquals(configBytes, File(output, "data/settings.properties").readBytes())
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sharedAssetHelperRejectsStaleHeaderAndRoundTripsCurrentOutput() {
+        val root = File(
+            System.getProperty("java.io.tmpdir"),
+            "cryptor-shared-asset-test-${System.nanoTime()}"
+        )
+        val masterKey = AesFileEncryptor.deriveAesKey(0x76543210ABCDEFL)
+        val stale = AesFileEncryptor.deriveMagic(masterKey) + ByteArray(AesFileEncryptor.IV_SIZE)
+        val staleDest = File(root, "stale/asset.png")
+        val relPath = "images/icon.png"
+        val plain = "shared helper output".toByteArray(Charsets.UTF_8)
+        val encryptedDest = File(root, relPath)
+
+        try {
+            staleDest.parentFile.mkdirs()
+            assertFailsWith<GradleException> {
+                EncryptAssetsTask.encryptAsset(stale, staleDest, "stale/asset.png", masterKey)
+            }
+            assertTrue(!staleDest.exists())
+
+            encryptedDest.parentFile.mkdirs()
+            EncryptAssetsTask.encryptAsset(plain, encryptedDest, relPath, masterKey)
+            val encrypted = encryptedDest.readBytes()
+            assertTrue(AesFileEncryptor.hasMagicPrefix(encrypted, masterKey))
+            assertTrue(AesFileEncryptor.isWellFormed(encrypted))
+            assertContentEquals(plain, AesFileEncryptor.decrypt(encrypted, masterKey, relPath))
         } finally {
             root.deleteRecursively()
         }

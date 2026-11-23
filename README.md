@@ -423,7 +423,8 @@ The task is a no-op when `enabled = false`. A local build that needs the default
 | `v1.9.25` | stable | Adds `cryptorKeyCheck` — fails when the key is still the public default; `DEFAULT_KEY` is exposed as a constant |
 | `v1.9.26` | stable | RoboVM/iOS: package a generated encrypted resource tree and decrypt real-file/audio reads through LibGDX's writable local directory |
 | `v1.9.27` | superseded | Corrupt-asset detection, build-time decrypt round trip, atomic audio publish; the injected runtime class set was incomplete, so release builds failed on an unresolved reference |
-| `v1.9.28` | ✅ **latest** | Ships every injected runtime class (`AesFileEncryptor$AssetCorruptionException`, `CryptorDiagnostics`) |
+| `v1.9.28` | stable | Ships every injected runtime class (`AesFileEncryptor$AssetCorruptionException`, `CryptorDiagnostics`) |
+| `v1.9.29` | ✅ **latest** | Unifies Android/JVM asset validation, rejects truncated magic-prefixed assets, and hardens locale-safe keys and audio caching |
 
 ---
 

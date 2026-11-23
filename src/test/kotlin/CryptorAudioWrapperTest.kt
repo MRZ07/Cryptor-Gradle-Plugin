@@ -6,6 +6,9 @@ import com.badlogic.gdx.files.FileHandle
 import com.badlogic.gdx.utils.GdxRuntimeException
 import java.io.File
 import java.lang.reflect.Proxy
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -142,6 +145,126 @@ class CryptorAudioWrapperTest {
                 File(published.parentFile, published.name + ".part").exists(),
                 "no partial file may be left behind"
             )
+        } finally {
+            Gdx.files = previousFiles
+            Gdx.app = previousApp
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun concurrentNewMusicCallsForSameAssetDoNotCollide() {
+        val root = File(
+            System.getProperty("java.io.tmpdir"),
+            "cryptor-audio-concurrent-${System.nanoTime()}"
+        )
+        val previousFiles = Gdx.files
+        val previousApp = Gdx.app
+        val plainBytes = byteArrayOf(1, 3, 5, 7, 9)
+        val track = File(root, "music/shared.mp3")
+        val ready = CountDownLatch(2)
+        val music = proxyOf(Music::class.java)
+        val audio = Proxy.newProxyInstance(
+            Audio::class.java.classLoader,
+            arrayOf(Audio::class.java)
+        ) { _, method, args ->
+            when (method.name) {
+                "newMusic" -> {
+                    val handle = args!![0] as FileHandle
+                    assertContentEquals(plainBytes, handle.readBytes())
+                    ready.countDown()
+                    assertTrue(ready.await(5, TimeUnit.SECONDS), "both calls should reach the backend")
+                    music
+                }
+                else -> throw UnsupportedOperationException("Unexpected Audio call: ${method.name}")
+            }
+        } as Audio
+        val files = Proxy.newProxyInstance(
+            Files::class.java.classLoader,
+            arrayOf(Files::class.java)
+        ) { _, method, args ->
+            when (method.name) {
+                "absolute" -> FileHandle(File(args!![0] as String))
+                else -> throw UnsupportedOperationException("Unexpected Files call: ${method.name}")
+            }
+        } as Files
+        val executor = Executors.newFixedThreadPool(2)
+
+        try {
+            root.mkdirs()
+            track.parentFile.mkdirs()
+            track.writeBytes(plainBytes)
+            Gdx.files = files
+            Gdx.app = null
+            val wrapper = CryptorAudioWrapper(audio)
+            val first = executor.submit { wrapper.newMusic(FileHandle(track)) }
+            val second = executor.submit { wrapper.newMusic(FileHandle(track)) }
+            first.get(10, TimeUnit.SECONDS)
+            second.get(10, TimeUnit.SECONDS)
+        } finally {
+            executor.shutdownNow()
+            Gdx.files = previousFiles
+            Gdx.app = previousApp
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun iosNewMusicRetryInvalidatesMaterializedCacheAndRebuildsIt() {
+        val root = File(
+            System.getProperty("java.io.tmpdir"),
+            "cryptor-audio-ios-retry-${System.nanoTime()}"
+        )
+        val previousFiles = Gdx.files
+        val previousApp = Gdx.app
+        val plainBytes = byteArrayOf(2, 4, 6, 8)
+        val track = File(root, "music/ios-track.mp3")
+        var attempts = 0
+        val music = proxyOf(Music::class.java)
+        val audio = Proxy.newProxyInstance(
+            Audio::class.java.classLoader,
+            arrayOf(Audio::class.java)
+        ) { _, method, args ->
+            when (method.name) {
+                "newMusic" -> {
+                    attempts++
+                    val handle = args!![0] as FileHandle
+                    if (attempts == 1) {
+                        handle.writeBytes(byteArrayOf(99), false)
+                        throw GdxRuntimeException("reject first iOS cache attempt")
+                    }
+                    assertContentEquals(plainBytes, handle.readBytes())
+                    music
+                }
+                else -> throw UnsupportedOperationException("Unexpected Audio call: ${method.name}")
+            }
+        } as Audio
+        val files = Proxy.newProxyInstance(
+            Files::class.java.classLoader,
+            arrayOf(Files::class.java)
+        ) { _, method, args ->
+            when (method.name) {
+                "absolute" -> FileHandle(File(args!![0] as String))
+                "local" -> FileHandle(File(root, args!![0] as String))
+                else -> throw UnsupportedOperationException("Unexpected Files call: ${method.name}")
+            }
+        } as Files
+
+        try {
+            root.mkdirs()
+            track.parentFile.mkdirs()
+            track.writeBytes(plainBytes)
+            Gdx.files = files
+            Gdx.app = Proxy.newProxyInstance(
+                com.badlogic.gdx.Application::class.java.classLoader,
+                arrayOf(com.badlogic.gdx.Application::class.java)
+            ) { _, method, _ ->
+                if (method.name == "getType") com.badlogic.gdx.Application.ApplicationType.iOS else null
+            } as com.badlogic.gdx.Application
+
+            CryptorAudioWrapper(audio).newMusic(FileHandle(track))
+
+            assertEquals(2, attempts)
         } finally {
             Gdx.files = previousFiles
             Gdx.app = previousApp

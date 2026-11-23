@@ -1,6 +1,7 @@
 import java.nio.ByteBuffer
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.Locale
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -40,7 +41,7 @@ object AesFileEncryptor {
     }
 
     fun deriveFileKey(masterKey: ByteArray, relativePath: String): ByteArray {
-        val normalized = relativePath.lowercase().replace('\\', '/')
+        val normalized = relativePath.lowercase(Locale.ROOT).replace('\\', '/')
         val md = MessageDigest.getInstance("SHA-256")
         md.update(masterKey)
         md.update(normalized.toByteArray(Charsets.UTF_8))
@@ -67,7 +68,14 @@ object AesFileEncryptor {
     }
 
     fun decrypt(raw: ByteArray, masterKey: ByteArray, relativePath: String): ByteArray {
-        if (!hasMagic(raw, masterKey)) return raw
+        if (!hasMagicPrefix(raw, masterKey)) return raw
+        if (raw.size < HEADER_SIZE) {
+            throw AssetCorruptionException(
+                "Encrypted asset '${relativePath.replace('\\', '/')}' is corrupt: " +
+                    "${raw.size} bytes is shorter than the $HEADER_SIZE-byte header. " +
+                    "Reinstall the app; if it persists the shipped asset is truncated."
+            )
+        }
         val storedLength = ByteBuffer.wrap(raw, MAGIC_SIZE, LENGTH_SIZE).int
         val ciphertextLength = raw.size - HEADER_SIZE
         if (storedLength < 0 || ciphertextLength != storedLength) {
@@ -84,7 +92,11 @@ object AesFileEncryptor {
     }
 
     fun hasMagic(raw: ByteArray, masterKey: ByteArray): Boolean {
-        if (raw.size < HEADER_SIZE) return false
+        return raw.size >= HEADER_SIZE && hasMagicPrefix(raw, masterKey)
+    }
+
+    fun hasMagicPrefix(raw: ByteArray, masterKey: ByteArray): Boolean {
+        if (raw.size < MAGIC_SIZE) return false
         val magic = deriveMagic(masterKey)
         return raw[0] == magic[0] && raw[1] == magic[1] &&
                raw[2] == magic[2] && raw[3] == magic[3]

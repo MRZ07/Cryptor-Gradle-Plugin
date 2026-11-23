@@ -5,6 +5,7 @@ import org.gradle.api.provider.ListProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.*
 import java.io.File
+import java.util.Locale
 
 @CacheableTask
 abstract class EncryptAssetsTask : DefaultTask() {
@@ -26,7 +27,7 @@ abstract class EncryptAssetsTask : DefaultTask() {
     fun encrypt() {
         val input     = inputDir.get().asFile
         val output    = outputDir.get().asFile
-        val exts      = assetExtensions.get().map { it.lowercase() }.toSet()
+        val exts      = assetExtensions.get().map { it.lowercase(Locale.ROOT) }.toSet()
         val masterKey = AesFileEncryptor.deriveAesKey(encryptionKey.get())
 
         output.deleteRecursively()
@@ -37,23 +38,10 @@ abstract class EncryptAssetsTask : DefaultTask() {
             val dest     = File(output, relative.path)
             dest.parentFile.mkdirs()
 
-            if (src.extension.lowercase() in exts) {
+            if (src.extension.lowercase(Locale.ROOT) in exts) {
                 val raw = src.readBytes()
-                if (AesFileEncryptor.hasMagic(raw, masterKey)) {
-                    if (!AesFileEncryptor.isWellFormed(raw)) {
-                        throw GradleException(
-                            "Cryptor: asset '$relative' is encrypted but not in the current asset format " +
-                                "(stale output from an older Cryptor version or a truncated file). " +
-                                "Clean the build and rebuild."
-                        )
-                    }
-                    dest.writeBytes(raw)
-                } else {
-                    val relPath = relative.path.replace(File.separatorChar, '/')
-                    val encrypted = AesFileEncryptor.encrypt(raw, masterKey, relPath)
-                    dest.writeBytes(encrypted)
-                    verifyRoundTrip(relPath, raw, encrypted, masterKey)
-                }
+                val relPath = relative.path.replace(File.separatorChar, '/')
+                encryptAsset(raw, dest, relPath, masterKey)
             } else {
                 src.copyTo(dest, overwrite = true)
             }
@@ -66,25 +54,45 @@ abstract class EncryptAssetsTask : DefaultTask() {
      * The runtime can only report corruption after a user installs the app; a broken key, a
      * truncated write or a format drift must stop the build instead.
      */
-    private fun verifyRoundTrip(
-        relativePath: String,
-        plaintext: ByteArray,
-        encrypted: ByteArray,
-        masterKey: ByteArray,
-    ) {
-        val decrypted = try {
-            AesFileEncryptor.decrypt(encrypted, masterKey, relativePath)
-        } catch (failure: RuntimeException) {
-            throw GradleException(
-                "Cryptor: asset '$relativePath' does not decrypt back to its source (${failure.message})",
-                failure
-            )
+    companion object {
+        /** Shared JVM/Android build-time implementation for one configured asset. */
+        internal fun encryptAsset(raw: ByteArray, dest: File, relPath: String, masterKey: ByteArray) {
+            if (AesFileEncryptor.hasMagicPrefix(raw, masterKey)) {
+                if (!AesFileEncryptor.isWellFormed(raw)) {
+                    throw GradleException(
+                        "Cryptor: asset '$relPath' is encrypted but not in the current asset format " +
+                            "(stale output from an older Cryptor version or a truncated file). Clean the build and rebuild."
+                    )
+                }
+                dest.writeBytes(raw)
+                return
+            }
+
+            val encrypted = AesFileEncryptor.encrypt(raw, masterKey, relPath)
+            dest.writeBytes(encrypted)
+            verifyRoundTrip(relPath, raw, encrypted, masterKey)
         }
-        if (!decrypted.contentEquals(plaintext)) {
-            throw GradleException(
-                "Cryptor: asset '$relativePath' does not decrypt back to its source " +
-                    "(${plaintext.size} source bytes, ${decrypted.size} decrypted bytes)"
-            )
+
+        private fun verifyRoundTrip(
+            relativePath: String,
+            plaintext: ByteArray,
+            encrypted: ByteArray,
+            masterKey: ByteArray,
+        ) {
+            val decrypted = try {
+                AesFileEncryptor.decrypt(encrypted, masterKey, relativePath)
+            } catch (failure: RuntimeException) {
+                throw GradleException(
+                    "Cryptor: asset '$relativePath' does not decrypt back to its source (${failure.message})",
+                    failure
+                )
+            }
+            if (!decrypted.contentEquals(plaintext)) {
+                throw GradleException(
+                    "Cryptor: asset '$relativePath' does not decrypt back to its source " +
+                        "(${plaintext.size} source bytes, ${decrypted.size} decrypted bytes)"
+                )
+            }
         }
     }
 }

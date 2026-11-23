@@ -7,6 +7,7 @@ import org.gradle.api.tasks.compile.AbstractCompile
 import org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile
 import java.io.File
 import java.security.MessageDigest
+import java.util.Locale
 
 class CryptorPlugin : Plugin<Project> {
 
@@ -265,32 +266,30 @@ class CryptorPlugin : Plugin<Project> {
                         val dir = mergedDir.get().asFile
                         if (!dir.exists()) return@doLast
                         val masterKey = AesFileEncryptor.deriveAesKey(extension.key.get())
-                        val exts = extension.assetExtensions.get().map { it.lowercase() }.toSet()
+                        val exts = extension.assetExtensions.get().map { it.lowercase(Locale.ROOT) }.toSet()
                         val configured = dir.walkTopDown()
-                            .filter { it.isFile && it.extension.lowercase() in exts }
+                            .filter { it.isFile && it.extension.lowercase(Locale.ROOT) in exts }
                             .toList()
                         configured.forEach { src ->
                             val raw = src.readBytes()
-                            if (AesFileEncryptor.hasMagic(raw, masterKey)) return@forEach
                             val relPath = src.relativeTo(dir).path.replace(java.io.File.separatorChar, '/')
-                            src.writeBytes(AesFileEncryptor.encrypt(raw, masterKey, relPath))
+                            EncryptAssetsTask.encryptAsset(raw, src, relPath, masterKey)
                         }
 
-                        // Post-condition: every file whose extension is configured must carry the
-                        // project magic now. A file that slips through ships as plaintext, and
-                        // nothing downstream would notice, so fail the build and name the files.
-                        // Only the 20-byte header is re-read.
-                        val plaintext = configured.filterNot { src ->
-                            src.inputStream().use { it.readNBytes(AesFileEncryptor.HEADER_SIZE) }
-                                .let { AesFileEncryptor.hasMagic(it, masterKey) }
+                        // Post-condition: every configured file must have the project magic and
+                        // the current complete header/length invariant, or fail with the paths.
+                        val invalid = configured.filterNot { src ->
+                            val raw = src.readBytes()
+                            AesFileEncryptor.hasMagicPrefix(raw, masterKey) &&
+                                AesFileEncryptor.isWellFormed(raw)
                         }
-                        if (plaintext.isNotEmpty()) {
-                            val sample = plaintext.take(5)
+                        if (invalid.isNotEmpty()) {
+                            val sample = invalid.take(5)
                                 .joinToString(", ") { it.relativeTo(dir).path }
                             throw GradleException(
-                                "[Cryptor] ${plaintext.size} asset(s) still unencrypted after " +
+                                "[Cryptor] ${invalid.size} asset(s) are not encrypted in the current format after " +
                                     "cryptorEncryptAssets$variantName: $sample" +
-                                    if (plaintext.size > 5) " …" else ""
+                                    if (invalid.size > 5) " …" else ""
                             )
                         }
                     }
@@ -480,7 +479,9 @@ class CryptorPlugin : Plugin<Project> {
 
                 encryptAssetsTask?.let { assetsTask ->
                     // Include encrypted assets in the JAR in place of the raw copies
-                    val encExtensions = extension.assetExtensions.get().toSet()
+                    val encExtensions = extension.assetExtensions.get()
+                        .map { it.lowercase(Locale.ROOT) }
+                        .toSet()
                     val resourcesMain = project.layout.buildDirectory.dir("resources/main").get().asFile
                     jar.dependsOn(assetsTask)
                     jar.from(assetsTask.flatMap { it.outputDir })
@@ -496,7 +497,7 @@ class CryptorPlugin : Plugin<Project> {
                     // libgdx128.png). macOS never noticed because libGDX skips icon
                     // loading on MacOsX.
                     jar.exclude { fileDetails ->
-                        if (fileDetails.file.extension.lowercase() !in encExtensions) return@exclude false
+                        if (fileDetails.file.extension.lowercase(Locale.ROOT) !in encExtensions) return@exclude false
                         val resMainPath = resourcesMain.canonicalPath + java.io.File.separator
                         if (!fileDetails.file.canonicalPath.startsWith(resMainPath)) return@exclude false
                         val relative = fileDetails.file.relativeTo(resourcesMain)

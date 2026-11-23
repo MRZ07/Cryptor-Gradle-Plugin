@@ -13,7 +13,7 @@ import java.io.Reader
  * They are private to prevent casual reflection access and zeroed out after the
  * master key has been assembled to reduce the heap exposure window.
  * ENABLED has been removed: the wrapper is always active when injected; non-encrypted
- * files pass through unchanged because [AesFileEncryptor.hasMagic] returns false.
+ * files pass through unchanged because [AesFileEncryptor.hasMagicPrefix] returns false.
  */
 class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
 
@@ -53,7 +53,8 @@ class CryptorFilesWrapper(private val delegate: Files) : Files by delegate {
                     offset += count
                 }
             }
-            offset == header.size && AesFileEncryptor.hasMagic(header, masterKey())
+            offset >= AesFileEncryptor.MAGIC_SIZE &&
+                AesFileEncryptor.hasMagicPrefix(header.copyOf(offset), masterKey())
         }
 
         private val rawBytes: ByteArray by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
